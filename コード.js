@@ -39,6 +39,14 @@ const SEAT_HEADER = "席番号";
 // 席番号の区切りとして認める文字（半角・全角カンマ、読点、空白）
 const SEAT_SEPARATOR = /[,，、\s]+/;
 const SEAT_ERROR_COLOR = "#f4cccc";
+const COLUMN_NAME = 4; // D列
+
+// 座席表シート（見る専用。予約一覧の席番号から自動で作り直す）
+const SEAT_MAP_SHEET_PREFIX = "座席表 ";
+const SEAT_MAP_COLUMNS = 10; // 1行に並べる席の数
+const SEAT_MAP_FIRST_ROW = 4; // 座席の並びを書き始める行
+const SEAT_ASSIGNED_COLOR = "#d9ead3";
+const SEAT_EMPTY_COLOR = "#ffffff";
 // 編集されたら席番号を再チェックする列（ステージ・申込人数・状態・席番号）
 const SEAT_RELATED_COLUMNS = [
   COLUMN_STAGE,
@@ -259,7 +267,7 @@ function showCapacityStatus() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("予約管理")
-    .addItem("席番号をチェック", "checkAllSeats")
+    .addItem("席番号をチェック・座席表を更新", "checkAllSeats")
     .addItem("定員の状況をログに出す", "showCapacityStatus")
     .addToUi();
 
@@ -296,7 +304,9 @@ function onEdit(e) {
     return;
   }
 
-  const errorCount = validateSeats(sheet);
+  const result = validateSeats(sheet);
+  updateSeatMaps(e.source, result);
+  const errorCount = result.errorCount;
 
   if (errorCount > 0) {
     e.source.toast(
@@ -319,7 +329,9 @@ function checkAllSeats() {
   }
 
   prepareSeatColumn(masterSheet);
-  const errorCount = validateSeats(masterSheet);
+  const result = validateSeats(masterSheet);
+  updateSeatMaps(spreadsheet, result);
+  const errorCount = result.errorCount;
   const message =
     errorCount > 0
       ? `問題のある席番号が${errorCount}件あります。赤いセルのメモを確認してください。`
@@ -345,13 +357,21 @@ function prepareSeatColumn(masterSheet) {
 
 /**
  * 「予約一覧」の全行の席番号をチェックし、問題のあるセルを赤くしてメモに理由を書く。
- * 問題がなくなったセルは色とメモを消す。問題のあるセルの数を返す。
+ * 問題がなくなったセルは色とメモを消す。
+ * 戻り値: errorCount（問題のあるセルの数）、rows（予約一覧の値）、
+ *        errorsByRow（行ごとの問題）、seatOwners（ステージ → 席番号 → 行の位置の配列）
  */
 function validateSeats(masterSheet) {
   const lastRow = masterSheet.getLastRow();
 
   if (lastRow < 2) {
-    return 0;
+    return {
+      errorCount: 0,
+      rows: [],
+      errorsByRow: [],
+      rowErrorCounts: [],
+      seatOwners: {},
+    };
   }
 
   const rows = masterSheet
@@ -402,6 +422,9 @@ function validateSeats(masterSheet) {
     });
   });
 
+  // 重複以外の問題（範囲外・人数違いなど）の件数。座席表で行全体を赤くするかの判定に使う
+  const rowErrorCounts = errorsByRow.map((errors) => errors.length);
+
   // 同じステージ内で、別の行と同じ席番号を使っていないか確認する
   Object.values(seatOwners).forEach((owners) => {
     Object.entries(owners).forEach(([seat, indexes]) => {
@@ -428,5 +451,126 @@ function validateSeats(masterSheet) {
   seatRange.setBackgrounds(backgrounds);
   seatRange.setNotes(notes);
 
-  return errorsByRow.filter((errors) => errors.length > 0).length;
+  return {
+    errorCount: errorsByRow.filter((errors) => errors.length > 0).length,
+    rows,
+    errorsByRow,
+    rowErrorCounts,
+    seatOwners,
+  };
+}
+
+/**
+ * ステージごとの「座席表」シートを作り直す（なければ作成する）。
+ * 緑 = 割当済み、赤 = 要確認（重複・人数違いなど）、白 = 空席。
+ */
+function updateSeatMaps(spreadsheet, result) {
+  const stages = [...new Set(Object.values(STAGE_BY_SHEET))];
+  const activeSheet = spreadsheet.getActiveSheet();
+  let createdSheet = false;
+
+  stages.forEach((stage) => {
+    const sheetName = `${SEAT_MAP_SHEET_PREFIX}${stage}`;
+    let sheet = spreadsheet.getSheetByName(sheetName);
+
+    if (!sheet) {
+      sheet = spreadsheet.insertSheet(sheetName, spreadsheet.getNumSheets());
+      // 見る専用: 編集しようとすると警告を出す
+      sheet
+        .protect()
+        .setDescription("座席表は自動で作り直されます。席番号は予約一覧のK列に入力してください。")
+        .setWarningOnly(true);
+      createdSheet = true;
+    }
+
+    writeSeatMap(sheet, stage, result);
+  });
+
+  // 新しいシートを作るとそちらに画面が切り替わるため、元のシートに戻す
+  if (createdSheet && activeSheet) {
+    activeSheet.activate();
+  }
+}
+
+/**
+ * 1ステージ分の座席表を書き込む。
+ */
+function writeSeatMap(sheet, stage, result) {
+  const owners = result.seatOwners[stage] || {};
+  const gridRows = Math.ceil(STAGE_CAPACITY / SEAT_MAP_COLUMNS);
+  const values = [];
+  const backgrounds = [];
+  let assignedCount = 0;
+  let problemCount = 0;
+
+  for (let gridRow = 0; gridRow < gridRows; gridRow++) {
+    const valueRow = [];
+    const backgroundRow = [];
+
+    for (let gridColumn = 0; gridColumn < SEAT_MAP_COLUMNS; gridColumn++) {
+      const seat = gridRow * SEAT_MAP_COLUMNS + gridColumn + 1;
+
+      if (seat > STAGE_CAPACITY) {
+        valueRow.push("");
+        backgroundRow.push(null);
+        continue;
+      }
+
+      const indexes = owners[seat] || [];
+
+      if (indexes.length === 0) {
+        valueRow.push(String(seat));
+        backgroundRow.push(SEAT_EMPTY_COLOR);
+        continue;
+      }
+
+      const names = indexes
+        .map((index) => result.rows[index][COLUMN_NAME - 1] || "（名前なし）")
+        .join("、");
+      // この席が重複している、または持ち主の行に重複以外の問題がある
+      const hasProblem =
+        indexes.length > 1 ||
+        indexes.some((index) => result.rowErrorCounts[index] > 0);
+
+      valueRow.push(`${seat}\n${names}`);
+      backgroundRow.push(hasProblem ? SEAT_ERROR_COLOR : SEAT_ASSIGNED_COLOR);
+      assignedCount++;
+      if (hasProblem) {
+        problemCount++;
+      }
+    }
+
+    values.push(valueRow);
+    backgrounds.push(backgroundRow);
+  }
+
+  const updatedAt = Utilities.formatDate(
+    new Date(),
+    "Asia/Tokyo",
+    "yyyy/MM/dd HH:mm:ss"
+  );
+
+  sheet.clear();
+  sheet
+    .getRange(1, 1, 3, 1)
+    .setValues([
+      [`${stage} 座席表（見る専用・自動更新）`],
+      [
+        `割当済み ${assignedCount}/${STAGE_CAPACITY}席　空き ${STAGE_CAPACITY - assignedCount}席　要確認 ${problemCount}席　（更新: ${updatedAt}）`,
+      ],
+      ["緑 = 割当済み　赤 = 要確認（予約一覧の赤いセルを確認）　白 = 空席"],
+    ]);
+  sheet.getRange(1, 1).setFontWeight("bold").setFontSize(14);
+
+  sheet
+    .getRange(SEAT_MAP_FIRST_ROW, 1, gridRows, SEAT_MAP_COLUMNS)
+    .setValues(values)
+    .setBackgrounds(backgrounds)
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle")
+    .setWrap(true)
+    .setBorder(true, true, true, true, true, true);
+
+  sheet.setColumnWidths(1, SEAT_MAP_COLUMNS, 90);
+  sheet.setRowHeights(SEAT_MAP_FIRST_ROW, gridRows, 45);
 }
