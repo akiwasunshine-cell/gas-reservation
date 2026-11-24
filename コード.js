@@ -35,6 +35,7 @@ const REQUIRED_QUESTIONS = [QUESTION_NAME, QUESTION_EMAIL, QUESTION_PEOPLE];
 
 const STATUS_ACCEPTED = "受付";
 const STATUS_REJECTED = "申込不可";
+const STATUS_CANCELLED = "キャンセル";
 
 // 定員の集計に含める状態（「申込不可」などは数えない）
 const COUNTED_STATUSES = [STATUS_ACCEPTED];
@@ -50,6 +51,7 @@ const COLUMN_NAME = 4; // D列
 const COLUMN_EMAIL = 5; // E列
 const COLUMN_PEOPLE = 6; // F列
 const COLUMN_STATUS = 7; // G列
+const COLUMN_MEMO = 8; // H列
 const COLUMN_SOURCE_SHEET = 9; // I列
 const COLUMN_SOURCE_ROW = 10; // J列
 const COLUMN_COUNT = 10; // フォーム送信時に書き込む列数（A〜J列）
@@ -86,12 +88,39 @@ const LOCK_TIMEOUT_MS = 30000;
 const EVENT_NAME = "東京キモノショー";
 const VENUE_TEXT = "ブルーミング中西ビル";
 const MAIL_SENDER_NAME = "東京キモノショー実行委員会";
-// キャンセルフォームのURL（空のままなら本文にURLを載せない）
-const CANCEL_FORM_URL = "";
 // 各ステージの開催日の何日前からリマインドを送るか（前日まで毎朝、未送信の人に送る）
 const REMINDER_DAYS_BEFORE = 3;
 const REMINDER_HOUR = 9; // 9時台に実行される
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// ===== キャンセルフォーム =====
+// フォームはメニュー「キャンセルフォームを作成・更新」でコードが作る
+const CANCEL_FORM_TITLE = `${EVENT_NAME} キャンセルフォーム`;
+const CANCEL_SHEET_NAME = "キャンセル受付"; // キャンセルフォームの回答シート
+const CANCEL_LOG_SHEET_NAME = "キャンセル処理結果";
+const CANCEL_LOG_HEADERS = [
+  "処理日時",
+  "キャンセル受付の行",
+  "ステージ",
+  "メールアドレス",
+  "キャンセル人数",
+  "結果",
+  "予約一覧の行",
+  "予約ID",
+  "完了メール",
+];
+const CANCEL_LOG_COLUMN_RESPONSE_ROW = 2; // B列
+const CANCEL_LOG_COLUMN_MAIL = 9; // I列
+const CANCEL_QUESTION_EMAIL = "メールアドレス";
+const CANCEL_QUESTION_STAGE = "ステージ";
+const CANCEL_QUESTION_PEOPLE = "キャンセルする人数";
+const CANCEL_FORM_DESCRIPTION =
+  "ご予約のときに入力したメールアドレスと、ステージを選んでください。";
+const CANCEL_CONFIRMATION_MESSAGE =
+  "キャンセルのお申し出を受け付けました。手続きが終わると、確認のメールをお送りします。\nメールが届かない場合は、お手数ですが実行委員会までお問い合わせください。";
+// スクリプトプロパティのキー（フォームを作ったときに保存する）
+const CANCEL_FORM_ID_KEY = "CANCEL_FORM_ID";
+const CANCEL_FORM_URL_KEY = "CANCEL_FORM_URL";
 
 function onReservationSubmit(e) {
   if (!e || !e.range || !e.source) {
@@ -101,6 +130,13 @@ function onReservationSubmit(e) {
   const spreadsheet = e.source;
   const responseSheet = e.range.getSheet();
   const responseSheetName = responseSheet.getName();
+
+  // フォーム送信トリガーは全フォーム共通のため、キャンセルフォームはここで振り分ける
+  if (responseSheetName === CANCEL_SHEET_NAME) {
+    onCancelSubmit(e);
+    return;
+  }
+
   const stageInfo = loadStages(spreadsheet);
   const stage = stageInfo.byResponseSheet[responseSheetName];
 
@@ -540,6 +576,8 @@ function onOpen() {
     .addItem("席番号の通知メールを送る", "sendSeatNotices")
     .addItem("テストメールを自分に送る", "sendTestMails")
     .addItem("リマインドの自動送信を設定", "setupReminderTrigger")
+    .addSeparator()
+    .addItem("キャンセルフォームを作成・更新", "setupCancelForm")
     .addToUi();
 
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -1286,9 +1324,10 @@ function buildEventLines(target) {
 
 function buildMailFooter() {
   const cancelLines = ["キャンセルの場合は、キャンセルフォームからお手続きください。"];
+  const cancelFormUrl = getCancelFormUrl();
 
-  if (CANCEL_FORM_URL) {
-    cancelLines.push(CANCEL_FORM_URL);
+  if (cancelFormUrl) {
+    cancelLines.push(cancelFormUrl);
   }
 
   return `${cancelLines.join("\n")}\n\n${MAIL_SENDER_NAME}`;
@@ -1326,5 +1365,436 @@ function buildReminderMail(target) {
       "",
       buildMailFooter(),
     ].join("\n"),
+  };
+}
+
+// ===== キャンセル =====
+
+/**
+ * メニューから実行: キャンセルフォームを作る（作成済みなら、ステージの選択肢を「ステージ設定」に合わせて更新する）。
+ * フォームは実行したアカウントのドライブに作られ、回答先はこのスプレッドシートの「キャンセル受付」シートになる。
+ */
+function setupCancelForm() {
+  const ui = SpreadsheetApp.getUi();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const stageInfo = loadStages(spreadsheet);
+  const stageNames = stageInfo.stages.map((stage) => stage.name);
+
+  if (stageNames.length === 0) {
+    ui.alert("キャンセルフォーム", `「${STAGE_SHEET_NAME}」に正しく設定されたステージがありません。`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const properties = PropertiesService.getScriptProperties();
+  const savedFormId = properties.getProperty(CANCEL_FORM_ID_KEY);
+  let form = null;
+
+  if (savedFormId) {
+    try {
+      form = FormApp.openById(savedFormId);
+    } catch (error) {
+      const answer = ui.alert(
+        "キャンセルフォーム",
+        `作成済みのキャンセルフォームを開けません（削除された、または今のアカウントに編集権限がない）。\n新しいキャンセルフォームを作りますか？\n\n${error}`,
+        ui.ButtonSet.OK_CANCEL
+      );
+
+      if (answer !== ui.Button.OK) {
+        return;
+      }
+    }
+  }
+
+  const isNew = !form;
+
+  if (isNew) {
+    form = createCancelForm(spreadsheet);
+  }
+
+  const stageItem = form
+    .getItems(FormApp.ItemType.LIST)
+    .find((item) => item.getTitle() === CANCEL_QUESTION_STAGE);
+
+  if (!stageItem) {
+    throw new Error(`キャンセルフォームに「${CANCEL_QUESTION_STAGE}」の質問（プルダウン）がありません。`);
+  }
+
+  stageItem.asListItem().setChoiceValues(stageNames);
+
+  let url = form.getPublishedUrl();
+
+  try {
+    url = form.shortenFormUrl(url);
+  } catch (error) {
+    console.warn(`フォームの短縮URLを作れませんでした: ${error}`);
+  }
+
+  properties.setProperty(CANCEL_FORM_URL_KEY, url);
+  ensureCancelLogSheet(spreadsheet);
+
+  const errorsText =
+    stageInfo.errors.length > 0
+      ? `\n\n次の行は設定に問題があるため、選択肢に入れていません。\n${stageInfo.errors.join("\n")}`
+      : "";
+
+  ui.alert(
+    "キャンセルフォーム",
+    `${isNew ? "キャンセルフォームを作りました。" : "ステージの選択肢を更新しました。"}\n\nURL（メールに自動で載ります）:\n${url}\n\nステージ: ${stageNames.join("、")}\n\nステージ設定を変えたら、もう一度このメニューを実行してください。${errorsText}`,
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * キャンセルフォームを新しく作り、回答シートを「キャンセル受付」にする。
+ */
+function createCancelForm(spreadsheet) {
+  const form = FormApp.create(CANCEL_FORM_TITLE);
+
+  form
+    .setDescription(CANCEL_FORM_DESCRIPTION)
+    .setConfirmationMessage(CANCEL_CONFIRMATION_MESSAGE)
+    .setAllowResponseEdits(false);
+  form
+    .addTextItem()
+    .setTitle(CANCEL_QUESTION_EMAIL)
+    .setRequired(true)
+    .setValidation(FormApp.createTextValidation().requireTextIsEmail().build());
+  form
+    .addListItem()
+    .setTitle(CANCEL_QUESTION_STAGE)
+    .setRequired(true)
+    .setChoiceValues(["（準備中）"]);
+  form
+    .addTextItem()
+    .setTitle(CANCEL_QUESTION_PEOPLE)
+    .setHelpText("全員キャンセルする場合は、申し込んだ人数を入力してください。")
+    .setRequired(true)
+    .setValidation(
+      FormApp.createTextValidation()
+        .setHelpText("数字で入力してください。")
+        .requireWholeNumber()
+        .build()
+    );
+
+  // 途中で失敗しても作ったフォームを見失わないよう、先に保存する
+  PropertiesService.getScriptProperties().setProperty(CANCEL_FORM_ID_KEY, form.getId());
+
+  form.setDestination(FormApp.DestinationType.SPREADSHEET, spreadsheet.getId());
+  SpreadsheetApp.flush();
+
+  // 回答先にした直後のシートは、開き直さないと見えないことがある
+  const refreshed = SpreadsheetApp.openById(spreadsheet.getId());
+  const oldSheet = refreshed.getSheetByName(CANCEL_SHEET_NAME);
+
+  if (oldSheet) {
+    // 前のキャンセルフォームの回答シートは残し、名前だけ変える（このシートへの回答は処理されなくなる）
+    oldSheet.setName(
+      `${CANCEL_SHEET_NAME}（旧 ${Utilities.formatDate(new Date(), TIME_ZONE, "yyyyMMdd-HHmm")}）`
+    );
+  }
+
+  const responseSheet = refreshed.getSheets().find((sheet) => {
+    const formUrl = sheet.getFormUrl();
+
+    if (!formUrl) {
+      return false;
+    }
+
+    try {
+      return FormApp.openByUrl(formUrl).getId() === form.getId();
+    } catch (error) {
+      return false;
+    }
+  });
+
+  if (!responseSheet) {
+    throw new Error(`キャンセルフォームは作りましたが、回答シートが見つかりません。新しくできた「フォームの回答」シートのタブ名を「${CANCEL_SHEET_NAME}」に変えてください。`);
+  }
+
+  responseSheet.setName(CANCEL_SHEET_NAME);
+  return form;
+}
+
+/**
+ * 「キャンセル処理結果」シートが無ければ作る。
+ */
+function ensureCancelLogSheet(spreadsheet) {
+  const existing = spreadsheet.getSheetByName(CANCEL_LOG_SHEET_NAME);
+
+  if (existing) {
+    return existing;
+  }
+
+  const sheet = spreadsheet.insertSheet(CANCEL_LOG_SHEET_NAME, spreadsheet.getNumSheets());
+  sheet
+    .getRange(1, 1, 1, CANCEL_LOG_HEADERS.length)
+    .setValues([CANCEL_LOG_HEADERS])
+    .setFontWeight("bold");
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+function getCancelFormUrl() {
+  return PropertiesService.getScriptProperties().getProperty(CANCEL_FORM_URL_KEY) || "";
+}
+
+/**
+ * キャンセルフォームの送信時（onReservationSubmit から呼ばれる）。
+ * メールアドレスとステージが一致する「受付」の予約が1件だけなら、自動でキャンセルし、完了メールを送る。
+ * 自動で処理できないときは予約一覧を変えず、実行したアカウント（トリガーを作った人）に知らせる。
+ */
+function onCancelSubmit(e) {
+  const spreadsheet = e.source;
+  const responseRow = e.range.getRow();
+  const answer = (questionTitle) =>
+    (e.namedValues[questionTitle] || [""])[0].trim();
+  const request = {
+    email: answer(CANCEL_QUESTION_EMAIL),
+    stageName: answer(CANCEL_QUESTION_STAGE),
+    cancelText: answer(CANCEL_QUESTION_PEOPLE),
+  };
+  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
+
+  if (!masterSheet) {
+    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
+  }
+
+  const logSheet = ensureCancelLogSheet(spreadsheet);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_TIMEOUT_MS);
+
+  let outcome;
+  let logRow;
+
+  try {
+    // 同じ回答を二重に処理しないための確認
+    const processedRows =
+      logSheet.getLastRow() >= 2
+        ? logSheet
+            .getRange(2, CANCEL_LOG_COLUMN_RESPONSE_ROW, logSheet.getLastRow() - 1, 1)
+            .getValues()
+            .map((row) => Number(row[0]))
+        : [];
+
+    if (processedRows.includes(responseRow)) {
+      return;
+    }
+
+    outcome = applyCancel(masterSheet, request);
+    logSheet.appendRow([
+      new Date(),
+      responseRow,
+      request.stageName,
+      request.email,
+      request.cancelText,
+      outcome.ok ? outcome.resultText : `自動で処理できません: ${outcome.reason}`,
+      outcome.rowNumber || "",
+      outcome.reservationId || "",
+      "",
+    ]);
+    logRow = logSheet.getLastRow();
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+
+  // 個人情報は出さず、行番号と結果だけを記録する
+  console.log(`${CANCEL_SHEET_NAME} ${responseRow}行目: ${outcome.ok ? outcome.resultText : outcome.reason}`);
+
+  const stageInfo = loadStages(spreadsheet);
+
+  if (outcome.ok) {
+    const mailCell = logSheet.getRange(logRow, CANCEL_LOG_COLUMN_MAIL);
+
+    if (!EMAIL_PATTERN.test(outcome.email)) {
+      mailCell.setValue("未送信（予約のメールアドレスが正しくない）");
+    } else if (MailApp.getRemainingDailyQuota() < 1) {
+      mailCell.setValue("未送信（今日の送信上限）");
+    } else {
+      try {
+        const mail = buildCancelMail(outcome, stageInfo.byName[outcome.stageName]);
+        MailApp.sendEmail({
+          to: outcome.email,
+          subject: mail.subject,
+          body: mail.body,
+          name: MAIL_SENDER_NAME,
+        });
+        mailCell.setValue(new Date());
+      } catch (error) {
+        console.error(`${CANCEL_SHEET_NAME} ${responseRow}行目: 完了メールの送信に失敗しました: ${error}`);
+        mailCell.setValue("送信失敗（実行ログを確認）");
+      }
+    }
+  } else {
+    notifyCancelProblem(spreadsheet, responseRow, outcome.reason);
+  }
+
+  // 席番号のチェックと座席表を最新にする（失敗してもキャンセル自体は済んでいる）
+  try {
+    refreshSeats(spreadsheet);
+  } catch (error) {
+    console.error(`キャンセル後の座席表の更新に失敗しました: ${error}`);
+  }
+}
+
+/**
+ * 予約一覧でキャンセルを反映する。
+ * 全員分: 状態を「キャンセル」にし、席番号を空ける（元の席番号はメモに残す）。
+ * 一部: 申込人数を減らす。席番号が入っていれば、人数と合わなくなるので赤く警告され、スタッフが選び直す。
+ */
+function applyCancel(masterSheet, request) {
+  const fail = (reason) => ({ ok: false, reason });
+  const cancelCount = parsePeopleCount(request.cancelText);
+
+  if (cancelCount === null) {
+    return fail("キャンセルする人数が正の整数ではありません");
+  }
+
+  const lastRow = masterSheet.getLastRow();
+
+  if (lastRow < 2) {
+    return fail("予約がありません");
+  }
+
+  const rows = masterSheet
+    .getRange(2, 1, lastRow - 1, COLUMN_SEAT)
+    .getDisplayValues();
+  const email = request.email.toLowerCase();
+  const matches = rows
+    .map((rowValues, index) => ({ rowValues, rowNumber: index + 2 }))
+    .filter(
+      ({ rowValues }) =>
+        rowValues[COLUMN_STAGE - 1] === request.stageName &&
+        rowValues[COLUMN_EMAIL - 1].trim().toLowerCase() === email &&
+        rowValues[COLUMN_STATUS - 1] === STATUS_ACCEPTED
+    );
+
+  if (matches.length === 0) {
+    return fail("メールアドレスとステージが一致する「受付」の予約がありません（入力の違い、またはキャンセル済み）");
+  }
+
+  if (matches.length > 1) {
+    return fail(
+      `メールアドレスとステージが一致する「受付」の予約が${matches.length}件あります（予約一覧 ${matches
+        .map((match) => `${match.rowNumber}行目`)
+        .join("、")}）。どれをキャンセルするか確認してください`
+    );
+  }
+
+  const { rowValues, rowNumber } = matches[0];
+  const people = parsePeopleCount(rowValues[COLUMN_PEOPLE - 1]);
+
+  if (people === null) {
+    return fail(`予約一覧 ${rowNumber}行目の申込人数が正しくありません`);
+  }
+
+  if (cancelCount > people) {
+    return fail(`キャンセルする人数（${cancelCount}名）が申込人数（${people}名）より多くなっています（予約一覧 ${rowNumber}行目）`);
+  }
+
+  const stamp = Utilities.formatDate(new Date(), TIME_ZONE, "M/d HH:mm");
+  const seatText = rowValues[COLUMN_SEAT - 1].trim();
+  const remaining = people - cancelCount;
+  let memo;
+  let resultText;
+
+  if (remaining === 0) {
+    masterSheet.getRange(rowNumber, COLUMN_STATUS).setValue(STATUS_CANCELLED);
+    masterSheet.getRange(rowNumber, COLUMN_SEAT).setValue("");
+    memo = `${stamp} キャンセル（全員${people}名）${seatText ? `。元の席番号: ${seatText}` : ""}`;
+    resultText = `キャンセル（全員${people}名）`;
+  } else {
+    masterSheet.getRange(rowNumber, COLUMN_PEOPLE).setValue(remaining);
+    memo = `${stamp} ${cancelCount}名キャンセル（${people}名→${remaining}名）`;
+    resultText = `一部キャンセル（${people}名→${remaining}名）`;
+
+    if (seatText) {
+      memo += `。席番号を${remaining}席に減らしてください`;
+      resultText += "。席番号を減らしてください";
+      // 席番号を直したら、通知メールで新しい席番号を送り直せるようにする
+      masterSheet.getRange(rowNumber, COLUMN_SEAT_NOTIFIED).setValue("");
+    }
+  }
+
+  const oldMemo = rowValues[COLUMN_MEMO - 1].trim();
+  masterSheet
+    .getRange(rowNumber, COLUMN_MEMO)
+    .setValue(oldMemo ? `${oldMemo}\n${memo}` : memo);
+
+  return {
+    ok: true,
+    resultText,
+    rowNumber,
+    reservationId: rowValues[COLUMN_RESERVATION_ID - 1],
+    name: rowValues[COLUMN_NAME - 1].trim(),
+    email: rowValues[COLUMN_EMAIL - 1].trim(),
+    stageName: request.stageName,
+    cancelCount,
+    remaining,
+    hadSeats: seatText !== "",
+  };
+}
+
+/**
+ * 自動で処理できなかったキャンセルを、実行したアカウント（トリガーを作った人）に知らせる。
+ */
+function notifyCancelProblem(spreadsheet, responseRow, reason) {
+  if (MailApp.getRemainingDailyQuota() < 1) {
+    return;
+  }
+
+  try {
+    MailApp.sendEmail({
+      to: Session.getEffectiveUser().getEmail(),
+      subject: `【${EVENT_NAME}】要確認: キャンセルを自動で処理できませんでした`,
+      body: [
+        `「${CANCEL_SHEET_NAME}」シート ${responseRow}行目のキャンセルを、自動で処理できませんでした。`,
+        "",
+        `理由: ${reason}`,
+        "",
+        "予約一覧は変更していません。お客様にも自動のメールは送っていません。",
+        `「${CANCEL_LOG_SHEET_NAME}」シートで内容を確認し、予約一覧を手で直して、お客様に連絡してください。`,
+        spreadsheet.getUrl(),
+      ].join("\n"),
+      name: MAIL_SENDER_NAME,
+    });
+  } catch (error) {
+    console.error(`キャンセルの要確認メールの送信に失敗しました: ${error}`);
+  }
+}
+
+function buildCancelMail(outcome, stage) {
+  const lines = [
+    `${outcome.name} 様`,
+    "",
+    `${EVENT_NAME}のご予約のキャンセルを受け付けました。`,
+    "",
+    `■ ステージ: ${outcome.stageName}`,
+  ];
+
+  if (stage) {
+    lines.push(`■ 日時: ${stage.dateText} ${stage.time}`);
+  }
+
+  lines.push(
+    `■ キャンセルした人数: ${outcome.cancelCount}名`,
+    `■ 残りのご予約: ${outcome.remaining > 0 ? `${outcome.remaining}名（このまま有効です）` : "なし"}`,
+    `■ 予約ID: ${outcome.reservationId}`,
+    ""
+  );
+
+  if (outcome.remaining > 0) {
+    if (outcome.hadSeats) {
+      lines.push("お席は、あらためてお知らせします。", "");
+    }
+
+    lines.push(buildMailFooter());
+  } else {
+    lines.push("またの機会をお待ちしております。", "", MAIL_SENDER_NAME);
+  }
+
+  return {
+    subject: `【${EVENT_NAME}】キャンセルを受け付けました（${outcome.stageName}）`,
+    body: lines.join("\n"),
   };
 }
