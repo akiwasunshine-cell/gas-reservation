@@ -1,0 +1,12 @@
+# clasp の認証情報（通常はホームにあるが念のため）
+.clasprc.json
+
+# 環境・機密情報
+.env
+
+# Node / エディタ
+node_modules/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
