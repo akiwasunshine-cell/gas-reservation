@@ -32,7 +32,20 @@ const COLUMN_PEOPLE = 6; // F列
 const COLUMN_STATUS = 7; // G列
 const COLUMN_SOURCE_SHEET = 9; // I列
 const COLUMN_SOURCE_ROW = 10; // J列
-const COLUMN_COUNT = 10;
+const COLUMN_COUNT = 10; // フォーム送信時に書き込む列数（A〜J列）
+const COLUMN_SEAT = 11; // K列（席番号。手入力）
+
+const SEAT_HEADER = "席番号";
+// 席番号の区切りとして認める文字（半角・全角カンマ、読点、空白）
+const SEAT_SEPARATOR = /[,，、\s]+/;
+const SEAT_ERROR_COLOR = "#f4cccc";
+// 編集されたら席番号を再チェックする列（ステージ・申込人数・状態・席番号）
+const SEAT_RELATED_COLUMNS = [
+  COLUMN_STAGE,
+  COLUMN_PEOPLE,
+  COLUMN_STATUS,
+  COLUMN_SEAT,
+];
 
 // 同時送信時にロック解放を待つ最大時間（ミリ秒）
 const LOCK_TIMEOUT_MS = 30000;
@@ -237,4 +250,183 @@ function showCapacityStatus() {
       `${stage}: ${reservedPeople}/${STAGE_CAPACITY}名（${formState}）`
     );
   });
+}
+
+/**
+ * スプレッドシートを開いたときにメニューを追加し、席番号の列を書式なしテキストにする。
+ * （シンプルトリガーのため設定不要）
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("予約管理")
+    .addItem("席番号をチェック", "checkAllSeats")
+    .addItem("定員の状況をログに出す", "showCapacityStatus")
+    .addToUi();
+
+  const masterSheet =
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MASTER_SHEET_NAME);
+
+  if (masterSheet) {
+    prepareSeatColumn(masterSheet);
+  }
+}
+
+/**
+ * 「予約一覧」の席番号に関わるセルが編集されたら、席番号をチェックする。
+ * （シンプルトリガーのため設定不要）
+ */
+function onEdit(e) {
+  if (!e || !e.range) {
+    return;
+  }
+
+  const sheet = e.range.getSheet();
+
+  if (sheet.getName() !== MASTER_SHEET_NAME || e.range.getLastRow() < 2) {
+    return;
+  }
+
+  const firstColumn = e.range.getColumn();
+  const lastColumn = e.range.getLastColumn();
+  const isRelated = SEAT_RELATED_COLUMNS.some(
+    (column) => firstColumn <= column && column <= lastColumn
+  );
+
+  if (!isRelated) {
+    return;
+  }
+
+  const errorCount = validateSeats(sheet);
+
+  if (errorCount > 0) {
+    e.source.toast(
+      `問題のある席番号が${errorCount}件あります。赤いセルのメモを確認してください。`,
+      "席番号チェック",
+      5
+    );
+  }
+}
+
+/**
+ * メニューから全件の席番号をチェックする（行の削除後などに使う）。
+ */
+function checkAllSeats() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
+
+  if (!masterSheet) {
+    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
+  }
+
+  prepareSeatColumn(masterSheet);
+  const errorCount = validateSeats(masterSheet);
+  const message =
+    errorCount > 0
+      ? `問題のある席番号が${errorCount}件あります。赤いセルのメモを確認してください。`
+      : "席番号に問題はありません。";
+
+  spreadsheet.toast(message, "席番号チェック", 5);
+}
+
+/**
+ * 席番号の列に見出しを付け、「1,2」が数値に変換されないよう書式なしテキストにする。
+ */
+function prepareSeatColumn(masterSheet) {
+  const header = masterSheet.getRange(1, COLUMN_SEAT);
+
+  if (header.getDisplayValue() === "") {
+    header.setValue(SEAT_HEADER);
+  }
+
+  masterSheet
+    .getRange(2, COLUMN_SEAT, masterSheet.getMaxRows() - 1, 1)
+    .setNumberFormat("@");
+}
+
+/**
+ * 「予約一覧」の全行の席番号をチェックし、問題のあるセルを赤くしてメモに理由を書く。
+ * 問題がなくなったセルは色とメモを消す。問題のあるセルの数を返す。
+ */
+function validateSeats(masterSheet) {
+  const lastRow = masterSheet.getLastRow();
+
+  if (lastRow < 2) {
+    return 0;
+  }
+
+  const rows = masterSheet
+    .getRange(2, 1, lastRow - 1, COLUMN_SEAT)
+    .getDisplayValues();
+  const errorsByRow = rows.map(() => []);
+  // ステージ → 席番号 → その席番号を持つ行の位置
+  const seatOwners = {};
+
+  rows.forEach((rowValues, index) => {
+    const seatText = rowValues[COLUMN_SEAT - 1].trim();
+
+    if (seatText === "") {
+      return;
+    }
+
+    const errors = errorsByRow[index];
+    const stage = rowValues[COLUMN_STAGE - 1];
+    const status = rowValues[COLUMN_STATUS - 1];
+    const seats = [];
+
+    seatText.split(SEAT_SEPARATOR).forEach((token) => {
+      const seat = Number(token);
+
+      if (!Number.isInteger(seat) || seat < 1 || seat > STAGE_CAPACITY) {
+        errors.push(`「${token}」は1〜${STAGE_CAPACITY}の番号ではありません`);
+      } else if (seats.includes(seat)) {
+        errors.push(`${seat}番が同じセルに2回入っています`);
+      } else {
+        seats.push(seat);
+      }
+    });
+
+    if (status !== STATUS_ACCEPTED) {
+      errors.push(`状態が「${status}」の申込に席番号が入っています`);
+    }
+
+    const people = parsePeopleCount(rowValues[COLUMN_PEOPLE - 1]);
+
+    if (people !== null && seats.length !== people) {
+      errors.push(`申込人数は${people}名ですが、席番号は${seats.length}個です`);
+    }
+
+    seatOwners[stage] = seatOwners[stage] || {};
+    seats.forEach((seat) => {
+      seatOwners[stage][seat] = seatOwners[stage][seat] || [];
+      seatOwners[stage][seat].push(index);
+    });
+  });
+
+  // 同じステージ内で、別の行と同じ席番号を使っていないか確認する
+  Object.values(seatOwners).forEach((owners) => {
+    Object.entries(owners).forEach(([seat, indexes]) => {
+      if (indexes.length < 2) {
+        return;
+      }
+
+      indexes.forEach((index) => {
+        const otherRows = indexes
+          .filter((otherIndex) => otherIndex !== index)
+          .map((otherIndex) => `${otherIndex + 2}行目`)
+          .join("、");
+        errorsByRow[index].push(`${seat}番が${otherRows}と重複しています`);
+      });
+    });
+  });
+
+  const backgrounds = errorsByRow.map((errors) => [
+    errors.length > 0 ? SEAT_ERROR_COLOR : null,
+  ]);
+  const notes = errorsByRow.map((errors) => [errors.join("\n")]);
+  const seatRange = masterSheet.getRange(2, COLUMN_SEAT, rows.length, 1);
+
+  seatRange.setBackgrounds(backgrounds);
+  seatRange.setNotes(notes);
+
+  return errorsByRow.filter((errors) => errors.length > 0).length;
 }
