@@ -578,6 +578,8 @@ function onOpen() {
     .addItem("リマインドの自動送信を設定", "setupReminderTrigger")
     .addSeparator()
     .addItem("キャンセルフォームを作成・更新", "setupCancelForm")
+    .addSeparator()
+    .addItem("ステージごとのCSVをダウンロード", "showCsvDialog")
     .addToUi();
 
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -1797,4 +1799,165 @@ function buildCancelMail(outcome, stage) {
     subject: `【${EVENT_NAME}】キャンセルを受け付けました（${outcome.stageName}）`,
     body: lines.join("\n"),
   };
+}
+
+// ===== CSV出力 =====
+
+const CSV_HEADERS = ["名前", "人数", "席番号"];
+
+/**
+ * メニューから実行: ステージごとの「受付」の予約を CSV でダウンロードする画面を出す。
+ * ダイアログを開いた時点の内容で全ステージ分の CSV を作っておき、ボタンを押すとすぐにダウンロードする
+ * （サーバーの応答を待ってからダウンロードすると、ブラウザに止められることがあるため）。
+ */
+function showCsvDialog() {
+  const ui = SpreadsheetApp.getUi();
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const stageInfo = loadStages(spreadsheet);
+
+  if (stageInfo.stages.length === 0) {
+    ui.alert("CSV出力", `「${STAGE_SHEET_NAME}」に正しく設定されたステージがありません。`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const result = validateSeats(masterSheet, stageInfo);
+  const createdAt = Utilities.formatDate(new Date(), TIME_ZONE, "yyyyMMdd-HHmm");
+  const files = stageInfo.stages.map((stage) =>
+    buildStageCsv(stage, result, createdAt)
+  );
+  const html = HtmlService.createHtmlOutput(buildCsvDialogHtml(files))
+    .setWidth(460)
+    .setHeight(520);
+
+  ui.showModalDialog(html, "ステージごとのCSV（「受付」の予約）");
+}
+
+/**
+ * 1ステージ分の CSV を作る。席番号の順に並べ、席番号が未入力の行は最後に登録順で並べる。
+ * 席番号に問題がある行は、入力されたままの値に「要確認」を付ける。
+ */
+function buildStageCsv(stage, result, createdAt) {
+  const entries = [];
+  let people = 0;
+  let problemCount = 0;
+
+  result.rows.forEach((rowValues, index) => {
+    if (
+      rowValues[COLUMN_STAGE - 1] !== stage.name ||
+      rowValues[COLUMN_STATUS - 1] !== STATUS_ACCEPTED
+    ) {
+      return;
+    }
+
+    const hasProblem = result.errorsByRow[index].length > 0;
+    const seats = hasProblem ? [] : result.seatsByRow[index];
+    const seatText = hasProblem
+      ? `要確認: ${rowValues[COLUMN_SEAT - 1].trim()}`
+      : seats.join("、");
+
+    if (hasProblem) {
+      problemCount++;
+    }
+
+    people += parsePeopleCount(rowValues[COLUMN_PEOPLE - 1]) || 0;
+    entries.push({
+      order: seats.length > 0 ? stage.seats.indexOf(seats[0]) : stage.seats.length,
+      index,
+      values: [
+        rowValues[COLUMN_NAME - 1].trim(),
+        rowValues[COLUMN_PEOPLE - 1],
+        seatText,
+      ],
+    });
+  });
+
+  entries.sort((a, b) => a.order - b.order || a.index - b.index);
+
+  const lines = [CSV_HEADERS, ...entries.map((entry) => entry.values)].map(
+    (values) => values.map(toCsvCell).join(",")
+  );
+
+  return {
+    stageName: stage.name,
+    fileName: `${stage.name}_${createdAt}.csv`.replace(/[\/:*?"<>|]/g, "-"),
+    csv: `${lines.join("\r\n")}\r\n`,
+    count: entries.length,
+    people,
+    problemCount,
+  };
+}
+
+/**
+ * CSV の1セルにする。Excel で数式として実行されないよう、= + - @ で始まる値には ' を付ける。
+ */
+function toCsvCell(value) {
+  let text = String(value === null || value === undefined ? "" : value);
+
+  if (/^[=+\-@]/.test(text)) {
+    text = `'${text}`;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function buildCsvDialogHtml(files) {
+  // </script> などで HTML が壊れないよう、< をエスケープして埋め込む
+  const data = JSON.stringify(files).replace(/</g, "\u003c");
+
+  return `<!DOCTYPE html>
+<html><head><base target="_top"><style>
+  body { font-family: sans-serif; font-size: 14px; margin: 0; }
+  .note { color: #555; font-size: 12px; margin: 0 0 12px; }
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
+  .info { font-size: 12px; color: #555; }
+  .warn { color: #c00; }
+  button { padding: 6px 12px; cursor: pointer; }
+  .all { margin-top: 14px; width: 100%; padding: 8px; font-weight: bold; }
+  #status { margin-top: 10px; font-size: 12px; color: #080; }
+</style></head><body>
+<p class="note">この画面を開いた時点の内容です。予約一覧を変えたら、メニューから開き直してください。<br>「すべて」を押して確認が出たら、複数ファイルのダウンロードを許可してください。</p>
+<div id="list"></div>
+<button class="all" id="all">すべてのステージをダウンロード</button>
+<div id="status"></div>
+<script>
+  const files = ${data};
+  const status = document.getElementById("status");
+  function download(file) {
+    const blob = new Blob(["\uFEFF" + file.csv], { type: "text/csv;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = file.fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    status.textContent = "ダウンロードしました: " + file.fileName;
+  }
+  const list = document.getElementById("list");
+  files.forEach((file) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const label = document.createElement("div");
+    label.textContent = file.stageName;
+    const info = document.createElement("div");
+    info.className = "info";
+    info.textContent = file.count + "件・" + file.people + "名";
+    if (file.problemCount > 0) {
+      const warn = document.createElement("span");
+      warn.className = "warn";
+      warn.textContent = "（席番号の要確認 " + file.problemCount + "件）";
+      info.appendChild(warn);
+    }
+    label.appendChild(info);
+    const button = document.createElement("button");
+    button.textContent = "ダウンロード";
+    button.onclick = () => download(file);
+    row.appendChild(label);
+    row.appendChild(button);
+    list.appendChild(row);
+  });
+  document.getElementById("all").onclick = () => {
+    files.forEach((file, i) => setTimeout(() => download(file), i * 400));
+  };
+</script>
+</body></html>`;
 }
