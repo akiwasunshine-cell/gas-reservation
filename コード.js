@@ -580,12 +580,18 @@ function onOpen() {
     .addItem("キャンセルフォームを作成・更新", "setupCancelForm")
     .addSeparator()
     .addItem("ステージごとのCSVをダウンロード", "showCsvDialog")
+    .addSeparator()
+    .addItem("使い方シートを作り直す", "rebuildUsageSheet")
     .addToUi();
 
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
 
   ensureStageSheet(spreadsheet);
+
+  if (!spreadsheet.getSheetByName(USAGE_SHEET_NAME)) {
+    writeUsageSheet(spreadsheet);
+  }
 
   if (masterSheet) {
     prepareSeatColumn(masterSheet);
@@ -1960,4 +1966,165 @@ function buildCsvDialogHtml(files) {
   };
 </script>
 </body></html>`;
+}
+
+// ===== 使い方シート =====
+
+const USAGE_SHEET_NAME = "使い方";
+const USAGE_COLUMN_WIDTHS = [220, 400, 260];
+const USAGE_HEADING_COLOR = "#d9ead3";
+const USAGE_TABLE_HEADER_COLOR = "#eeeeee";
+
+/**
+ * 「使い方」シートの内容。1要素が1行。
+ * 種類: title（題名）、h（見出し）、p（文。長い文は1行に収まるよう分ける）、th（表の見出し）、t（表の行）、""（空行）
+ */
+function buildUsageLines() {
+  return [
+    ["title", `${EVENT_NAME} 予約管理の使い方`],
+    ["p", "このシートは自動で作られます（メニュー「予約管理 → 使い方シートを作り直す」で最新にできます）。"],
+    [""],
+    ["h", "1. この仕組みでできること"],
+    ["p", "・お客様がステージごとの予約フォームから申し込むと、「予約一覧」シートに自動で1行追加されます。"],
+    ["p", "・定員を超える申込は「申込不可」になります。定員に達したステージのフォームは自動で締め切られます。"],
+    ["p", "・スタッフが席番号を入力し、メニューから席番号の通知メールを送ります。"],
+    ["p", `・開催日の${REMINDER_DAYS_BEFORE}日前から前日まで、毎朝${REMINDER_HOUR}時ごろにリマインドメールが自動で送られます。`],
+    ["p", "・お客様はキャンセルフォームからキャンセルでき、予約一覧に自動で反映されます。"],
+    ["p", "・ステージごとの名簿（名前・人数・席番号）をCSVでダウンロードできます。"],
+    [""],
+    ["h", "2. シートの一覧"],
+    ["th", "シート", "内容", "編集してよいか"],
+    ["t", USAGE_SHEET_NAME, "この説明", "編集しない（作り直すと消えます）"],
+    ["t", MASTER_SHEET_NAME, "すべての予約。1行が1件の予約", "K列（席番号）を入力する。ほかの列は下の「よくある作業」のときだけ"],
+    ["t", STAGE_SHEET_NAME, "ステージごとの日時・座席・定員", "ステージを追加・変更するときに編集する"],
+    ["t", `${SEAT_MAP_SHEET_PREFIX}（ステージ名）`, "席の割り当て状況。緑 = 割当済み、赤 = 要確認、白 = 空席", "見るだけ（自動で作り直されます）"],
+    ["t", "4/17 ステージ1 など", "各予約フォームの回答（元のデータ）", "編集しない。タブ名も変えない"],
+    ["t", CANCEL_SHEET_NAME, "キャンセルフォームの回答（元のデータ）", "編集しない。タブ名も変えない"],
+    ["t", CANCEL_LOG_SHEET_NAME, "キャンセルを自動で処理した結果", "見るだけ"],
+    [""],
+    ["h", `3. 「${MASTER_SHEET_NAME}」の列`],
+    ["th", "列", "内容", "書き込む人"],
+    ["t", "A 登録日時", "申込を受け付けた日時", "自動"],
+    ["t", "B 予約ID", "予約ごとの番号（TK-…）。お客様へのメールにも載ります", "自動"],
+    ["t", "C ステージ", "申し込んだステージ", "自動"],
+    ["t", "D 名前 / E メールアドレス / F 申込人数", "フォームに入力された内容", "自動（人数の変更は手で）"],
+    ["t", "G 状態", `${STATUS_ACCEPTED}：有効な予約 / ${STATUS_REJECTED}：定員超過 / ${STATUS_CANCELLED}：取り消し済み。定員に数えるのは「${STATUS_ACCEPTED}」だけ`, "自動（手でキャンセルするときは手で）"],
+    ["t", "H メモ", "定員超過の理由、キャンセルの記録", "自動"],
+    ["t", "I 元回答シート名 / J 元回答行番号", "二重登録を防ぐための記録", "自動。消さない"],
+    ["t", "K 席番号", "割り当てた席番号", "スタッフが入力"],
+    ["t", "L 席番号通知日時", "席番号の通知メールを送った日時", "自動"],
+    ["t", "M リマインド送信日時", "リマインドメールを送った日時", "自動"],
+    [""],
+    ["h", "4. 席番号の入れ方（K列）"],
+    ["p", "・申込人数と同じ数の番号を「1,2」「A,B」のように入力します（区切りはカンマ・読点・空白のどれでもOK）。"],
+    ["p", `・使える番号は「${STAGE_SHEET_NAME}」の「座席」の列で決まります（例: 1-132,A-L）。全角や小文字でも大丈夫です。`],
+    ["p", "・問題があるとセルが赤くなります。セルにマウスを乗せると、メモに理由が出ます。直すと赤色は消えます。"],
+    ["p", "　赤くなる例: 座席にない番号、ほかの人と同じ番号、人数と番号の数が違う、「受付」以外の行に入力した"],
+    ["p", "・K列には手で色を付けないでください（チェックのたびに自動で上書きされます）。"],
+    ["p", "・行を削除したあとなどは、メニュー「席番号をチェック・座席表を更新」で全件をチェックし直せます。"],
+    [""],
+    ["h", "5. メニュー「予約管理」"],
+    ["th", "メニュー", "すること", "使うアカウント"],
+    ["t", "席番号をチェック・座席表を更新", "全件の席番号をチェックし、座席表シートを作り直す", "だれでも"],
+    ["t", "定員の状況をログに出す", "ステージごとの予約人数を実行ログに出す（担当者向け）", "だれでも"],
+    ["t", "席番号の通知メールを送る", "席番号が入っていて、まだ通知していない「受付」の人に送る。送る前に件数の確認が出る", "団体のアカウント"],
+    ["t", "テストメールを自分に送る", "通知とリマインドの見本を、実行した人に送る", "団体のアカウント"],
+    ["t", "リマインドの自動送信を設定", "毎朝のリマインドを開始する。本番前に1回だけ実行", "団体のアカウント"],
+    ["t", "キャンセルフォームを作成・更新", "1回目はキャンセルフォームを作る。2回目からはステージの選択肢を最新にする", "担当者"],
+    ["t", "ステージごとのCSVをダウンロード", "ステージごとの名簿（受付の人の名前・人数・席番号）をダウンロードする", "だれでも"],
+    ["t", "使い方シートを作り直す", "このシートを最新の内容にする", "だれでも"],
+    ["p", "※メールは、メニューを実行したアカウントから送られます。お客様へのメールは団体のアカウントで実行してください。"],
+    [""],
+    ["h", "6. よくある作業"],
+    ["th", "やりたいこと", "手順", "注意"],
+    ["t", "席番号を知らせる", `K列に席番号を入力 → 赤いセルがないか確認 → メニュー「席番号の通知メールを送る」`, "赤いセルの人には送られません。直してからもう一度実行"],
+    ["t", "通知・リマインドを送り直す", "その人の L列（通知）または M列（リマインド）を空にして、もう一度送る", "席番号を変えても自動では送り直されません"],
+    ["t", "電話などでキャンセルを受けた", `G列を「${STATUS_CANCELLED}」にし、K列の席番号を消す。H列に日付と理由をメモ`, "締め切ったフォームは自動で再開しません。再開するならフォームの「回答を受付中」をオンにする"],
+    ["t", "人数を減らしたい", "F列の人数を直し、K列の席番号もその数に合わせる", "席番号を変えたら L列を空にして通知を送り直す"],
+    ["t", "「要確認: キャンセルを自動で処理できませんでした」のメールが来た", `「${CANCEL_LOG_SHEET_NAME}」で内容を確認 → 予約一覧を手で直す → お客様に連絡`, "このときお客様には自動のメールは送られていません"],
+    ["t", "ステージを追加する", `①「${STAGE_SHEET_NAME}」に1行追加 ②予約フォームを作り、回答先をこのスプレッドシートにする ③できた回答シートのタブ名を、ステージ設定のA列と同じにする ④メニュー「キャンセルフォームを作成・更新」`, `フォームの質問タイトルは「${QUESTION_NAME}」「${QUESTION_EMAIL}」「${QUESTION_PEOPLE}」と完全に同じにする（すべて必須）`],
+    ["t", "A〜L席を使わないステージ", `「${STAGE_SHEET_NAME}」の座席を「1-132」にする`, "定員の列が空欄なら、席数がそのまま定員になる"],
+    ["t", "名簿を印刷・共有したい", "メニュー「ステージごとのCSVをダウンロード」", "名前が入っているので、渡す相手と保存場所に注意"],
+    [""],
+    ["h", "7. やってはいけないこと"],
+    ["p", `・「${MASTER_SHEET_NAME}」の列の順番を変えたり、途中に列を足したりしない（自動処理が壊れます）。`],
+    ["p", "・予約フォームの質問タイトルや、回答シート・「キャンセル受付」のタブ名を変えない。"],
+    ["p", `・受付を始めたあとに「${STAGE_SHEET_NAME}」のステージ名を変えない（既存の予約とのつながりが切れます）。`],
+    ["p", "・I列・J列を消さない（同じ申込が二重に登録される原因になります）。"],
+    ["p", "・お客様の名前やメールアドレスを、関係者以外に見せたり送ったりしない。"],
+    [""],
+    ["h", "8. 困ったとき"],
+    ["th", "困りごと", "考えられる原因", "対処"],
+    ["t", "申込が予約一覧に載らない", "ステージ設定の誤り、フォームの質問タイトル・タブ名の変更、権限の承認切れ", "回答シートには残っています。メニュー「席番号をチェック・座席表を更新」で設定の問題が表示されます。直らなければ担当者に連絡"],
+    ["t", "メールが一部送れない", "1日の送信上限（無料Gmail 約100通、Google Workspace 約1,500通）", "翌日にもう一度メニューを実行する（送った人には二重に送られません）"],
+    ["t", "座席表が古い", "自動で作り直すのは予約一覧やステージ設定を編集したとき", "メニュー「席番号をチェック・座席表を更新」"],
+    ["t", "メニュー「予約管理」が出ない", "読み込みの途中", "スプレッドシートを再読み込みする（F5）"],
+  ];
+}
+
+/**
+ * 「使い方」シートを作り直す（なければ先頭に作る）。
+ */
+function writeUsageSheet(spreadsheet) {
+  const lines = buildUsageLines();
+  const columnCount = USAGE_COLUMN_WIDTHS.length;
+  let sheet = spreadsheet.getSheetByName(USAGE_SHEET_NAME);
+
+  if (!sheet) {
+    const activeSheet = spreadsheet.getActiveSheet();
+    sheet = spreadsheet.insertSheet(USAGE_SHEET_NAME, 0);
+    sheet
+      .protect()
+      .setDescription("使い方シートは自動で作り直されます。内容はメニュー「使い方シートを作り直す」で更新してください。")
+      .setWarningOnly(true);
+
+    if (activeSheet) {
+      activeSheet.activate();
+    }
+  }
+
+  sheet.clear();
+
+  const isTable = (type) => type === "th" || type === "t";
+  const values = lines.map(([, ...cells]) =>
+    Array.from({ length: columnCount }, (_, index) => cells[index] || "")
+  );
+  const style = (pick) => lines.map(([type]) => Array(columnCount).fill(pick(type)));
+
+  sheet
+    .getRange(1, 1, lines.length, columnCount)
+    .setValues(values)
+    .setVerticalAlignment("top")
+    .setFontSizes(style((type) => (type === "title" ? 16 : type === "h" ? 12 : 10)))
+    .setFontWeights(style((type) => (["title", "h", "th"].includes(type) ? "bold" : "normal")))
+    .setBackgrounds(
+      style((type) =>
+        type === "h" ? USAGE_HEADING_COLOR : type === "th" ? USAGE_TABLE_HEADER_COLOR : null
+      )
+    )
+    // 表は折り返し、文と見出しは右の空いたセルにはみ出して表示する
+    .setWrapStrategies(
+      style((type) =>
+        isTable(type) ? SpreadsheetApp.WrapStrategy.WRAP : SpreadsheetApp.WrapStrategy.OVERFLOW
+      )
+    );
+
+  lines.forEach(([type], index) => {
+    if (isTable(type)) {
+      sheet.getRange(index + 1, 1, 1, columnCount).setBorder(true, true, true, true, true, true);
+    }
+  });
+
+  USAGE_COLUMN_WIDTHS.forEach((width, index) => sheet.setColumnWidth(index + 1, width));
+  sheet.setHiddenGridlines(true);
+  return sheet;
+}
+
+/**
+ * メニューから実行: 「使い方」シートを最新の内容で作り直す。
+ */
+function rebuildUsageSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  writeUsageSheet(spreadsheet).activate();
+  spreadsheet.toast("使い方シートを作り直しました。", "使い方", 5);
 }
