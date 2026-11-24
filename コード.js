@@ -11,7 +11,7 @@ const STAGE_CAPACITY = 157;
 const MASTER_SHEET_NAME = "予約一覧";
 
 // フォームの質問タイトル（フォーム側と完全一致させる）
-const QUESTION_NAME = "お名前";
+const QUESTION_NAME = "名前";
 const QUESTION_EMAIL = "メールアドレス";
 const QUESTION_PEOPLE = "申込人数";
 const REQUIRED_QUESTIONS = [QUESTION_NAME, QUESTION_EMAIL, QUESTION_PEOPLE];
