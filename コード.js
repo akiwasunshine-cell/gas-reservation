@@ -1,14 +1,31 @@
-// 回答シート名（シートのタブ名と完全一致） → ステージ名
-// フォーム（ステージ）を追加したら、ここにも1行追加する
-const STAGE_BY_SHEET = {
-  "4/17 ステージ1": "4/17 ステージ1",
-  "4/17 ステージ2": "4/17 ステージ2",
-};
-
-// 各ステージの定員（人数の合計）
-const STAGE_CAPACITY = 157;
-
+// ===== 基本設定 =====
 const MASTER_SHEET_NAME = "予約一覧";
+const TIME_ZONE = "Asia/Tokyo";
+
+// ===== ステージ設定シート =====
+// ステージの追加・日時・座席・定員は、このシートに書く（コードの変更は不要）
+const STAGE_SHEET_NAME = "ステージ設定";
+const STAGE_SHEET_HEADERS = [
+  "回答シート名",
+  "ステージ名",
+  "開催日",
+  "時間",
+  "座席",
+  "定員（空欄なら席数）",
+];
+// 「ステージ設定」シートの列（0始まり）
+const STAGE_COLUMN_RESPONSE_SHEET = 0; // A列: 回答シートのタブ名と完全一致
+const STAGE_COLUMN_NAME = 1; // B列: 予約一覧のC列に入る名前（空欄なら回答シート名）
+const STAGE_COLUMN_DATE = 2; // C列: 開催日
+const STAGE_COLUMN_TIME = 3; // D列: 時間（メールにそのまま載る）
+const STAGE_COLUMN_SEATS = 4; // E列: 例「1-132」「1-132,A-L」
+const STAGE_COLUMN_CAPACITY = 5; // F列: 空欄なら席数
+// 「ステージ設定」シートが無いときに作る初期の行
+const DEFAULT_STAGE_ROWS = [
+  ["4/17 ステージ1", "4/17 ステージ1", new Date(2027, 3, 17), "11:00〜", "1-132,A-L", ""],
+  ["4/17 ステージ2", "4/17 ステージ2", new Date(2027, 3, 17), "11:00〜", "1-132,A-L", ""],
+];
+const WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"];
 
 // フォームの質問タイトル（フォーム側と完全一致させる）
 const QUESTION_NAME = "名前";
@@ -27,19 +44,25 @@ const CLOSED_FORM_MESSAGE =
   "このステージは定員に達したため、受付を終了しました。";
 
 // 「予約一覧」の列（1始まり）
+const COLUMN_RESERVATION_ID = 2; // B列
 const COLUMN_STAGE = 3; // C列
+const COLUMN_NAME = 4; // D列
+const COLUMN_EMAIL = 5; // E列
 const COLUMN_PEOPLE = 6; // F列
 const COLUMN_STATUS = 7; // G列
 const COLUMN_SOURCE_SHEET = 9; // I列
 const COLUMN_SOURCE_ROW = 10; // J列
 const COLUMN_COUNT = 10; // フォーム送信時に書き込む列数（A〜J列）
 const COLUMN_SEAT = 11; // K列（席番号。手入力）
+const COLUMN_SEAT_NOTIFIED = 12; // L列（席番号の通知を送った日時）
+const COLUMN_REMINDED = 13; // M列（リマインドを送った日時）
 
 const SEAT_HEADER = "席番号";
-// 席番号の区切りとして認める文字（半角・全角カンマ、読点、空白）
-const SEAT_SEPARATOR = /[,，、\s]+/;
+const SEAT_NOTIFIED_HEADER = "席番号通知日時";
+const REMINDED_HEADER = "リマインド送信日時";
+// 席番号の区切りとして認める文字（全角は半角にそろえてから分ける）
+const SEAT_SEPARATOR = /[,、\s]+/;
 const SEAT_ERROR_COLOR = "#f4cccc";
-const COLUMN_NAME = 4; // D列
 
 // 座席表シート（見る専用。予約一覧の席番号から自動で作り直す）
 const SEAT_MAP_SHEET_PREFIX = "座席表 ";
@@ -58,20 +81,35 @@ const SEAT_RELATED_COLUMNS = [
 // 同時送信時にロック解放を待つ最大時間（ミリ秒）
 const LOCK_TIMEOUT_MS = 30000;
 
+// ===== メール（席番号の通知・リマインド） =====
+// 文言はここを書き換える（日時はステージ設定シートから入る）
+const EVENT_NAME = "東京キモノショー";
+const VENUE_TEXT = "ブルーミング中西ビル";
+const MAIL_SENDER_NAME = "東京キモノショー実行委員会";
+// キャンセルフォームのURL（空のままなら本文にURLを載せない）
+const CANCEL_FORM_URL = "";
+// 各ステージの開催日の何日前からリマインドを送るか（前日まで毎朝、未送信の人に送る）
+const REMINDER_DAYS_BEFORE = 3;
+const REMINDER_HOUR = 9; // 9時台に実行される
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 function onReservationSubmit(e) {
   if (!e || !e.range || !e.source) {
     throw new Error("フォーム送信トリガーから実行してください。");
   }
 
+  const spreadsheet = e.source;
   const responseSheet = e.range.getSheet();
   const responseSheetName = responseSheet.getName();
-  const stage = STAGE_BY_SHEET[responseSheetName];
+  const stageInfo = loadStages(spreadsheet);
+  const stage = stageInfo.byResponseSheet[responseSheetName];
 
   if (!stage) {
-    throw new Error(`ステージ設定がありません: ${responseSheetName}`);
+    throw new Error(
+      `「${STAGE_SHEET_NAME}」シートに回答シート「${responseSheetName}」の正しい設定がありません。${stageInfo.errors.join(" / ")}`
+    );
   }
 
-  const spreadsheet = e.source;
   const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
 
   if (!masterSheet) {
@@ -123,8 +161,8 @@ function onReservationSubmit(e) {
       return;
     }
 
-    const reservedPeople = countReservedPeople(existingRows, stage);
-    const remaining = Math.max(STAGE_CAPACITY - reservedPeople, 0);
+    const reservedPeople = countReservedPeople(existingRows, stage.name);
+    const remaining = Math.max(stage.capacity - reservedPeople, 0);
 
     // 定員を超える申込は受け付けない
     const isRejected = people > remaining;
@@ -143,7 +181,7 @@ function onReservationSubmit(e) {
     masterSheet.appendRow([
       new Date(),
       reservationId,
-      stage,
+      stage.name,
       answer(QUESTION_NAME),
       answer(QUESTION_EMAIL),
       answer(QUESTION_PEOPLE),
@@ -157,13 +195,13 @@ function onReservationSubmit(e) {
     SpreadsheetApp.flush();
 
     const addedPeople = isRejected ? 0 : people;
-    shouldCloseForm = reservedPeople + addedPeople >= STAGE_CAPACITY;
+    shouldCloseForm = reservedPeople + addedPeople >= stage.capacity;
   } finally {
     lock.releaseLock();
   }
 
   if (shouldCloseForm) {
-    closeForm(responseSheet, stage);
+    closeForm(responseSheet, stage.name);
   }
 }
 
@@ -183,11 +221,11 @@ function getExistingRows(masterSheet) {
 /**
  * 指定ステージで定員に数える申込人数の合計を返す。
  */
-function countReservedPeople(existingRows, stage) {
+function countReservedPeople(existingRows, stageName) {
   return existingRows
     .filter(
       (existingRow) =>
-        existingRow[COLUMN_STAGE - 1] === stage &&
+        existingRow[COLUMN_STAGE - 1] === stageName &&
         COUNTED_STATUSES.includes(existingRow[COLUMN_STATUS - 1])
     )
     .reduce(
@@ -209,12 +247,12 @@ function parsePeopleCount(value) {
  * 回答シートにつながっているフォームの受付を締め切る。
  * 失敗しても予約の記録は済んでいるため、ログに残すだけにする。
  */
-function closeForm(responseSheet, stage) {
+function closeForm(responseSheet, stageName) {
   try {
     const formUrl = responseSheet.getFormUrl();
 
     if (!formUrl) {
-      console.warn(`${stage}: 回答シートにフォームがつながっていません。`);
+      console.warn(`${stageName}: 回答シートにフォームがつながっていません。`);
       return;
     }
 
@@ -223,10 +261,10 @@ function closeForm(responseSheet, stage) {
     if (form.isAcceptingResponses()) {
       form.setCustomClosedFormMessage(CLOSED_FORM_MESSAGE);
       form.setAcceptingResponses(false);
-      console.log(`${stage}: 定員に達したためフォームを締め切りました。`);
+      console.log(`${stageName}: 定員に達したためフォームを締め切りました。`);
     }
   } catch (error) {
-    console.error(`${stage}: フォームの締め切りに失敗しました: ${error}`);
+    console.error(`${stageName}: フォームの締め切りに失敗しました: ${error}`);
   }
 }
 
@@ -235,18 +273,15 @@ function closeForm(responseSheet, stage) {
  * Apps Script エディタから手動で実行する（フォーム操作の権限承認にも使う）。
  */
 function showCapacityStatus() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
-
-  if (!masterSheet) {
-    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
-  }
-
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const stageInfo = loadStages(spreadsheet);
   const existingRows = getExistingRows(masterSheet);
 
-  Object.entries(STAGE_BY_SHEET).forEach(([sheetName, stage]) => {
-    const reservedPeople = countReservedPeople(existingRows, stage);
-    const responseSheet = spreadsheet.getSheetByName(sheetName);
+  stageInfo.errors.forEach((error) => console.warn(error));
+
+  stageInfo.stages.forEach((stage) => {
+    const reservedPeople = countReservedPeople(existingRows, stage.name);
+    const responseSheet = spreadsheet.getSheetByName(stage.responseSheet);
     const formUrl = responseSheet ? responseSheet.getFormUrl() : null;
     const accepting = formUrl
       ? FormApp.openByUrl(formUrl).isAcceptingResponses()
@@ -255,10 +290,242 @@ function showCapacityStatus() {
       accepting === null ? "フォーム未接続" : accepting ? "受付中" : "締切";
 
     console.log(
-      `${stage}: ${reservedPeople}/${STAGE_CAPACITY}名（${formState}）`
+      `${stage.name}: ${reservedPeople}/${stage.capacity}名（${formState}）`
     );
   });
 }
+
+// ===== ステージ設定の読み込み =====
+
+/**
+ * 「ステージ設定」シートが無ければ、見出しと初期の行を入れて作る。
+ */
+function ensureStageSheet(spreadsheet) {
+  const existing = spreadsheet.getSheetByName(STAGE_SHEET_NAME);
+
+  if (existing) {
+    return existing;
+  }
+
+  const activeSheet = spreadsheet.getActiveSheet();
+  const sheet = spreadsheet.insertSheet(STAGE_SHEET_NAME, 0);
+  const columnCount = STAGE_SHEET_HEADERS.length;
+
+  // 「11:00〜」「1-132」が日付や数値に変換されないよう、時間・座席の列を書式なしテキストにする
+  sheet.getRange(2, STAGE_COLUMN_TIME + 1, sheet.getMaxRows() - 1, 2).setNumberFormat("@");
+  sheet.getRange(2, STAGE_COLUMN_DATE + 1, sheet.getMaxRows() - 1, 1).setNumberFormat("yyyy/mm/dd");
+  sheet.getRange(1, 1, 1, columnCount).setValues([STAGE_SHEET_HEADERS]).setFontWeight("bold");
+  sheet
+    .getRange(2, 1, DEFAULT_STAGE_ROWS.length, columnCount)
+    .setValues(DEFAULT_STAGE_ROWS);
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidths(1, columnCount, 140);
+
+  if (activeSheet) {
+    activeSheet.activate();
+  }
+
+  return sheet;
+}
+
+/**
+ * 「ステージ設定」シートを読み込む。
+ * 戻り値: stages（正しく読めたステージ）、errors（問題のある行の説明）、
+ *        byResponseSheet（回答シート名 → ステージ）、byName（ステージ名 → ステージ）
+ * 問題のある行は stages に含めない（ほかのステージは動き続ける）。
+ */
+function loadStages(spreadsheet) {
+  const sheet = ensureStageSheet(spreadsheet);
+  const stages = [];
+  const errors = [];
+  const lastRow = sheet.getLastRow();
+  const columnCount = STAGE_SHEET_HEADERS.length;
+  const range =
+    lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, columnCount) : null;
+  const values = range ? range.getValues() : [];
+  const displayValues = range ? range.getDisplayValues() : [];
+
+  values.forEach((rowValues, index) => {
+    const texts = displayValues[index].map((value) => String(value).trim());
+
+    if (texts.every((text) => text === "")) {
+      return;
+    }
+
+    const rowErrors = [];
+    const responseSheet = texts[STAGE_COLUMN_RESPONSE_SHEET];
+    const name = texts[STAGE_COLUMN_NAME] || responseSheet;
+    const date = parseStageDate(rowValues[STAGE_COLUMN_DATE]);
+    const seatSpec = texts[STAGE_COLUMN_SEATS];
+    const parsedSeats = parseSeatSpec(seatSpec);
+    let capacity = parsedSeats.seats.length;
+
+    if (responseSheet === "") {
+      rowErrors.push("回答シート名が空欄です");
+    }
+
+    if (stages.some((stage) => stage.responseSheet === responseSheet)) {
+      rowErrors.push(`回答シート名「${responseSheet}」がほかの行と重複しています`);
+    }
+
+    if (stages.some((stage) => stage.name === name)) {
+      rowErrors.push(`ステージ名「${name}」がほかの行と重複しています`);
+    }
+
+    if (!date) {
+      rowErrors.push("開催日が日付になっていません");
+    }
+
+    if (seatSpec === "") {
+      rowErrors.push("座席が空欄です");
+    }
+
+    rowErrors.push(...parsedSeats.errors);
+
+    if (texts[STAGE_COLUMN_CAPACITY] !== "") {
+      const customCapacity = parsePeopleCount(texts[STAGE_COLUMN_CAPACITY]);
+
+      if (customCapacity === null) {
+        rowErrors.push("定員が正の整数ではありません");
+      } else if (customCapacity > parsedSeats.seats.length) {
+        rowErrors.push(`定員が席数（${parsedSeats.seats.length}席）より多くなっています`);
+      } else {
+        capacity = customCapacity;
+      }
+    }
+
+    if (rowErrors.length > 0) {
+      errors.push(`${STAGE_SHEET_NAME} ${index + 2}行目: ${rowErrors.join("、")}`);
+      return;
+    }
+
+    const weekday = WEEKDAYS[Number(Utilities.formatDate(date, TIME_ZONE, "u")) - 1];
+    const reminderDate = new Date(
+      date.getTime() - REMINDER_DAYS_BEFORE * 24 * 60 * 60 * 1000
+    );
+
+    stages.push({
+      responseSheet,
+      name,
+      dateKey: Utilities.formatDate(date, TIME_ZONE, "yyyy-MM-dd"),
+      reminderKey: Utilities.formatDate(reminderDate, TIME_ZONE, "yyyy-MM-dd"),
+      dateText: `${Utilities.formatDate(date, TIME_ZONE, "yyyy年M月d日")}（${weekday}）`,
+      time: texts[STAGE_COLUMN_TIME],
+      seatSpec,
+      seats: parsedSeats.seats,
+      seatSet: new Set(parsedSeats.seats),
+      capacity,
+    });
+  });
+
+  return {
+    stages,
+    errors,
+    byResponseSheet: Object.fromEntries(
+      stages.map((stage) => [stage.responseSheet, stage])
+    ),
+    byName: Object.fromEntries(stages.map((stage) => [stage.name, stage])),
+  };
+}
+
+/**
+ * 開催日のセルの値を日付にする。日付でなければ null を返す。
+ */
+function parseStageDate(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return isNaN(value.getTime()) ? null : value;
+  }
+
+  const match = String(value).trim().match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+
+  return match
+    ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+    : null;
+}
+
+/**
+ * 全角の英数字・記号を半角にし、英字を大文字にする（「ａ」「Ａ」「１」→「A」「A」「1」）。
+ */
+function normalizeSeatText(text) {
+  return String(text)
+    .replace(/[０-９Ａ-Ｚａ-ｚ]/g, (char) =>
+      String.fromCharCode(char.charCodeAt(0) - 0xfee0)
+    )
+    .replace(/[，]/g, ",")
+    .replace(/[－ー―‐〜～~]/g, "-")
+    .toUpperCase();
+}
+
+/**
+ * 1つの席番号をそろえる（「01」→「1」）。
+ */
+function normalizeSeatId(token) {
+  return /^\d+$/.test(token) ? String(Number(token)) : token;
+}
+
+/**
+ * 「1-132,A-L」のような座席の書き方を、席番号の配列にする。
+ * 書ける形: 数字の範囲（1-132）、英字1文字の範囲（A-L）、単独の数字・英字。カンマ区切り。
+ */
+function parseSeatSpec(spec) {
+  const seats = [];
+  const errors = [];
+  const maxSeats = 10000;
+
+  normalizeSeatText(spec)
+    .split(SEAT_SEPARATOR)
+    .filter((part) => part !== "")
+    .forEach((part) => {
+      const numberRange = part.match(/^(\d+)-(\d+)$/);
+      const letterRange = part.match(/^([A-Z])-([A-Z])$/);
+      const added = [];
+
+      if (numberRange) {
+        const first = Number(numberRange[1]);
+        const last = Number(numberRange[2]);
+
+        if (first < 1 || last < first || last - first >= maxSeats) {
+          errors.push(`座席「${part}」の範囲が正しくありません`);
+          return;
+        }
+
+        for (let seat = first; seat <= last; seat++) {
+          added.push(String(seat));
+        }
+      } else if (letterRange) {
+        const first = letterRange[1].charCodeAt(0);
+        const last = letterRange[2].charCodeAt(0);
+
+        if (last < first) {
+          errors.push(`座席「${part}」の範囲が正しくありません`);
+          return;
+        }
+
+        for (let code = first; code <= last; code++) {
+          added.push(String.fromCharCode(code));
+        }
+      } else if (/^\d+$/.test(part) && Number(part) >= 1) {
+        added.push(normalizeSeatId(part));
+      } else if (/^[A-Z]$/.test(part)) {
+        added.push(part);
+      } else {
+        errors.push(`座席「${part}」の書き方が正しくありません（例: 1-132,A-L）`);
+        return;
+      }
+
+      added.forEach((seat) => {
+        if (seats.includes(seat)) {
+          errors.push(`座席の${seat}番が2回書かれています`);
+        } else {
+          seats.push(seat);
+        }
+      });
+    });
+
+  return { seats, errors: [...new Set(errors)] };
+}
+
+// ===== メニュー・席番号チェック =====
 
 /**
  * スプレッドシートを開いたときにメニューを追加し、席番号の列を書式なしテキストにする。
@@ -269,10 +536,16 @@ function onOpen() {
     .createMenu("予約管理")
     .addItem("席番号をチェック・座席表を更新", "checkAllSeats")
     .addItem("定員の状況をログに出す", "showCapacityStatus")
+    .addSeparator()
+    .addItem("席番号の通知メールを送る", "sendSeatNotices")
+    .addItem("テストメールを自分に送る", "sendTestMails")
+    .addItem("リマインドの自動送信を設定", "setupReminderTrigger")
     .addToUi();
 
-  const masterSheet =
-    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MASTER_SHEET_NAME);
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
+
+  ensureStageSheet(spreadsheet);
 
   if (masterSheet) {
     prepareSeatColumn(masterSheet);
@@ -280,7 +553,7 @@ function onOpen() {
 }
 
 /**
- * 「予約一覧」の席番号に関わるセルが編集されたら、席番号をチェックする。
+ * 「予約一覧」の席番号に関わるセル、または「ステージ設定」が編集されたら、席番号をチェックする。
  * （シンプルトリガーのため設定不要）
  */
 function onEdit(e) {
@@ -288,32 +561,39 @@ function onEdit(e) {
     return;
   }
 
-  const sheet = e.range.getSheet();
+  const sheetName = e.range.getSheet().getName();
 
-  if (sheet.getName() !== MASTER_SHEET_NAME || e.range.getLastRow() < 2) {
-    return;
-  }
+  if (sheetName === MASTER_SHEET_NAME) {
+    if (e.range.getLastRow() < 2) {
+      return;
+    }
 
-  const firstColumn = e.range.getColumn();
-  const lastColumn = e.range.getLastColumn();
-  const isRelated = SEAT_RELATED_COLUMNS.some(
-    (column) => firstColumn <= column && column <= lastColumn
-  );
-
-  if (!isRelated) {
-    return;
-  }
-
-  const result = validateSeats(sheet);
-  updateSeatMaps(e.source, result);
-  const errorCount = result.errorCount;
-
-  if (errorCount > 0) {
-    e.source.toast(
-      `問題のある席番号が${errorCount}件あります。赤いセルのメモを確認してください。`,
-      "席番号チェック",
-      5
+    const firstColumn = e.range.getColumn();
+    const lastColumn = e.range.getLastColumn();
+    const isRelated = SEAT_RELATED_COLUMNS.some(
+      (column) => firstColumn <= column && column <= lastColumn
     );
+
+    if (!isRelated) {
+      return;
+    }
+  } else if (sheetName !== STAGE_SHEET_NAME) {
+    return;
+  }
+
+  const { stageInfo, result } = refreshSeats(e.source);
+  const messages = [];
+
+  if (stageInfo.errors.length > 0) {
+    messages.push(`ステージ設定に問題が${stageInfo.errors.length}件あります。メニュー「席番号をチェック・座席表を更新」で内容を確認してください。`);
+  }
+
+  if (result.errorCount > 0) {
+    messages.push(`問題のある席番号が${result.errorCount}件あります。赤いセルのメモを確認してください。`);
+  }
+
+  if (messages.length > 0) {
+    e.source.toast(messages.join("\n"), "席番号チェック", 8);
   }
 }
 
@@ -321,34 +601,66 @@ function onEdit(e) {
  * メニューから全件の席番号をチェックする（行の削除後などに使う）。
  */
 function checkAllSeats() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
-
-  if (!masterSheet) {
-    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
-  }
+  const { spreadsheet, masterSheet } = getMasterSheet();
 
   prepareSeatColumn(masterSheet);
-  const result = validateSeats(masterSheet);
-  updateSeatMaps(spreadsheet, result);
-  const errorCount = result.errorCount;
+  const { stageInfo, result } = refreshSeats(spreadsheet);
+
+  if (stageInfo.errors.length > 0) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert(
+      "ステージ設定に問題があります",
+      `次の行は使われません（そのステージの予約受付も止まります）。\n\n${stageInfo.errors.join("\n")}`,
+      ui.ButtonSet.OK
+    );
+  }
+
   const message =
-    errorCount > 0
-      ? `問題のある席番号が${errorCount}件あります。赤いセルのメモを確認してください。`
+    result.errorCount > 0
+      ? `問題のある席番号が${result.errorCount}件あります。赤いセルのメモを確認してください。`
       : "席番号に問題はありません。";
 
   spreadsheet.toast(message, "席番号チェック", 5);
 }
 
 /**
- * 席番号の列に見出しを付け、「1,2」が数値に変換されないよう書式なしテキストにする。
+ * ステージ設定を読み、席番号をチェックして、座席表を作り直す。
+ */
+function refreshSeats(spreadsheet) {
+  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
+
+  if (!masterSheet) {
+    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
+  }
+
+  const stageInfo = loadStages(spreadsheet);
+  const result = validateSeats(masterSheet, stageInfo);
+  updateSeatMaps(spreadsheet, result, stageInfo);
+
+  return { stageInfo, result };
+}
+
+/**
+ * 席番号・メール送信日時の列に見出しを付け、席番号の列は「1,2」が数値に変換されないよう書式なしテキストにする。
  */
 function prepareSeatColumn(masterSheet) {
-  const header = masterSheet.getRange(1, COLUMN_SEAT);
+  const maxColumns = masterSheet.getMaxColumns();
 
-  if (header.getDisplayValue() === "") {
-    header.setValue(SEAT_HEADER);
+  if (maxColumns < COLUMN_REMINDED) {
+    masterSheet.insertColumnsAfter(maxColumns, COLUMN_REMINDED - maxColumns);
   }
+
+  [
+    [COLUMN_SEAT, SEAT_HEADER],
+    [COLUMN_SEAT_NOTIFIED, SEAT_NOTIFIED_HEADER],
+    [COLUMN_REMINDED, REMINDED_HEADER],
+  ].forEach(([column, title]) => {
+    const header = masterSheet.getRange(1, column);
+
+    if (header.getDisplayValue() === "") {
+      header.setValue(title);
+    }
+  });
 
   masterSheet
     .getRange(2, COLUMN_SEAT, masterSheet.getMaxRows() - 1, 1)
@@ -359,9 +671,10 @@ function prepareSeatColumn(masterSheet) {
  * 「予約一覧」の全行の席番号をチェックし、問題のあるセルを赤くしてメモに理由を書く。
  * 問題がなくなったセルは色とメモを消す。
  * 戻り値: errorCount（問題のあるセルの数）、rows（予約一覧の値）、
- *        errorsByRow（行ごとの問題）、seatOwners（ステージ → 席番号 → 行の位置の配列）
+ *        errorsByRow（行ごとの問題）、rowErrorCounts（重複以外の問題の数）、
+ *        seatsByRow（行ごとの席番号）、seatOwners（ステージ名 → 席番号 → 行の位置の配列）
  */
-function validateSeats(masterSheet) {
+function validateSeats(masterSheet, stageInfo) {
   const lastRow = masterSheet.getLastRow();
 
   if (lastRow < 2) {
@@ -370,6 +683,7 @@ function validateSeats(masterSheet) {
       rows: [],
       errorsByRow: [],
       rowErrorCounts: [],
+      seatsByRow: [],
       seatOwners: {},
     };
   }
@@ -378,32 +692,41 @@ function validateSeats(masterSheet) {
     .getRange(2, 1, lastRow - 1, COLUMN_SEAT)
     .getDisplayValues();
   const errorsByRow = rows.map(() => []);
-  // ステージ → 席番号 → その席番号を持つ行の位置
+  const seatsByRow = rows.map(() => []);
+  // ステージ名 → 席番号 → その席番号を持つ行の位置
   const seatOwners = {};
 
   rows.forEach((rowValues, index) => {
-    const seatText = rowValues[COLUMN_SEAT - 1].trim();
+    const seatText = normalizeSeatText(rowValues[COLUMN_SEAT - 1]).trim();
 
     if (seatText === "") {
       return;
     }
 
     const errors = errorsByRow[index];
-    const stage = rowValues[COLUMN_STAGE - 1];
+    const stageName = rowValues[COLUMN_STAGE - 1];
+    const stage = stageInfo.byName[stageName];
     const status = rowValues[COLUMN_STATUS - 1];
-    const seats = [];
+    const seats = seatsByRow[index];
 
-    seatText.split(SEAT_SEPARATOR).forEach((token) => {
-      const seat = Number(token);
+    if (!stage) {
+      errors.push(`ステージ「${stageName}」が「${STAGE_SHEET_NAME}」にありません（または設定に問題があります）`);
+    } else {
+      seatText
+        .split(SEAT_SEPARATOR)
+        .filter((token) => token !== "")
+        .forEach((token) => {
+          const seat = normalizeSeatId(token);
 
-      if (!Number.isInteger(seat) || seat < 1 || seat > STAGE_CAPACITY) {
-        errors.push(`「${token}」は1〜${STAGE_CAPACITY}の番号ではありません`);
-      } else if (seats.includes(seat)) {
-        errors.push(`${seat}番が同じセルに2回入っています`);
-      } else {
-        seats.push(seat);
-      }
-    });
+          if (!stage.seatSet.has(seat)) {
+            errors.push(`「${token}」は${stage.name}の席番号ではありません（座席: ${stage.seatSpec}）`);
+          } else if (seats.includes(seat)) {
+            errors.push(`${seat}番が同じセルに2回入っています`);
+          } else {
+            seats.push(seat);
+          }
+        });
+    }
 
     if (status !== STATUS_ACCEPTED) {
       errors.push(`状態が「${status}」の申込に席番号が入っています`);
@@ -411,15 +734,18 @@ function validateSeats(masterSheet) {
 
     const people = parsePeopleCount(rowValues[COLUMN_PEOPLE - 1]);
 
-    if (people !== null && seats.length !== people) {
+    if (stage && people !== null && seats.length !== people) {
       errors.push(`申込人数は${people}名ですが、席番号は${seats.length}個です`);
     }
 
-    seatOwners[stage] = seatOwners[stage] || {};
-    seats.forEach((seat) => {
-      seatOwners[stage][seat] = seatOwners[stage][seat] || [];
-      seatOwners[stage][seat].push(index);
-    });
+    if (stage) {
+      seatOwners[stage.name] = seatOwners[stage.name] || {};
+      seats.forEach((seat) => {
+        seatOwners[stage.name][seat] = seatOwners[stage.name][seat] || [];
+        seatOwners[stage.name][seat].push(index);
+      });
+      seats.sort((a, b) => stage.seats.indexOf(a) - stage.seats.indexOf(b));
+    }
   });
 
   // 重複以外の問題（範囲外・人数違いなど）の件数。座席表で行全体を赤くするかの判定に使う
@@ -456,21 +782,23 @@ function validateSeats(masterSheet) {
     rows,
     errorsByRow,
     rowErrorCounts,
+    seatsByRow,
     seatOwners,
   };
 }
+
+// ===== 座席表 =====
 
 /**
  * ステージごとの「座席表」シートを作り直す（なければ作成する）。
  * 緑 = 割当済み、赤 = 要確認（重複・人数違いなど）、白 = 空席。
  */
-function updateSeatMaps(spreadsheet, result) {
-  const stages = [...new Set(Object.values(STAGE_BY_SHEET))];
+function updateSeatMaps(spreadsheet, result, stageInfo) {
   const activeSheet = spreadsheet.getActiveSheet();
   let createdSheet = false;
 
-  stages.forEach((stage) => {
-    const sheetName = `${SEAT_MAP_SHEET_PREFIX}${stage}`;
+  stageInfo.stages.forEach((stage) => {
+    const sheetName = `${SEAT_MAP_SHEET_PREFIX}${stage.name}`;
     let sheet = spreadsheet.getSheetByName(sheetName);
 
     if (!sheet) {
@@ -493,60 +821,69 @@ function updateSeatMaps(spreadsheet, result) {
 }
 
 /**
- * 1ステージ分の座席表を書き込む。
+ * 1ステージ分の座席表を書き込む。数字の席を先に並べ、英字の席は1行あけて下に並べる。
  */
 function writeSeatMap(sheet, stage, result) {
-  const owners = result.seatOwners[stage] || {};
-  const gridRows = Math.ceil(STAGE_CAPACITY / SEAT_MAP_COLUMNS);
-  const values = [];
-  const backgrounds = [];
+  const owners = result.seatOwners[stage.name] || {};
+  const blocks = [
+    stage.seats.filter((seat) => /^\d+$/.test(seat)),
+    stage.seats.filter((seat) => !/^\d+$/.test(seat)),
+  ].filter((block) => block.length > 0);
   let assignedCount = 0;
   let problemCount = 0;
 
-  for (let gridRow = 0; gridRow < gridRows; gridRow++) {
-    const valueRow = [];
-    const backgroundRow = [];
+  const blockGrids = blocks.map((block) => {
+    const values = [];
+    const backgrounds = [];
 
-    for (let gridColumn = 0; gridColumn < SEAT_MAP_COLUMNS; gridColumn++) {
-      const seat = gridRow * SEAT_MAP_COLUMNS + gridColumn + 1;
+    for (let start = 0; start < block.length; start += SEAT_MAP_COLUMNS) {
+      const valueRow = [];
+      const backgroundRow = [];
 
-      if (seat > STAGE_CAPACITY) {
-        valueRow.push("");
-        backgroundRow.push(null);
-        continue;
+      for (let offset = 0; offset < SEAT_MAP_COLUMNS; offset++) {
+        const seat = block[start + offset];
+
+        if (seat === undefined) {
+          valueRow.push("");
+          backgroundRow.push(null);
+          continue;
+        }
+
+        const indexes = owners[seat] || [];
+
+        if (indexes.length === 0) {
+          valueRow.push(seat);
+          backgroundRow.push(SEAT_EMPTY_COLOR);
+          continue;
+        }
+
+        const names = indexes
+          .map((index) => result.rows[index][COLUMN_NAME - 1] || "（名前なし）")
+          .join("、");
+        // この席が重複している、または持ち主の行に重複以外の問題がある
+        const hasProblem =
+          indexes.length > 1 ||
+          indexes.some((index) => result.rowErrorCounts[index] > 0);
+
+        valueRow.push(`${seat}\n${names}`);
+        backgroundRow.push(hasProblem ? SEAT_ERROR_COLOR : SEAT_ASSIGNED_COLOR);
+        assignedCount++;
+        if (hasProblem) {
+          problemCount++;
+        }
       }
 
-      const indexes = owners[seat] || [];
-
-      if (indexes.length === 0) {
-        valueRow.push(String(seat));
-        backgroundRow.push(SEAT_EMPTY_COLOR);
-        continue;
-      }
-
-      const names = indexes
-        .map((index) => result.rows[index][COLUMN_NAME - 1] || "（名前なし）")
-        .join("、");
-      // この席が重複している、または持ち主の行に重複以外の問題がある
-      const hasProblem =
-        indexes.length > 1 ||
-        indexes.some((index) => result.rowErrorCounts[index] > 0);
-
-      valueRow.push(`${seat}\n${names}`);
-      backgroundRow.push(hasProblem ? SEAT_ERROR_COLOR : SEAT_ASSIGNED_COLOR);
-      assignedCount++;
-      if (hasProblem) {
-        problemCount++;
-      }
+      values.push(valueRow);
+      backgrounds.push(backgroundRow);
     }
 
-    values.push(valueRow);
-    backgrounds.push(backgroundRow);
-  }
+    return { values, backgrounds };
+  });
 
+  const seatCount = stage.seats.length;
   const updatedAt = Utilities.formatDate(
     new Date(),
-    "Asia/Tokyo",
+    TIME_ZONE,
     "yyyy/MM/dd HH:mm:ss"
   );
 
@@ -554,23 +891,440 @@ function writeSeatMap(sheet, stage, result) {
   sheet
     .getRange(1, 1, 3, 1)
     .setValues([
-      [`${stage} 座席表（見る専用・自動更新）`],
+      [`${stage.name}（${stage.dateText} ${stage.time}）座席表（見る専用・自動更新）`],
       [
-        `割当済み ${assignedCount}/${STAGE_CAPACITY}席　空き ${STAGE_CAPACITY - assignedCount}席　要確認 ${problemCount}席　（更新: ${updatedAt}）`,
+        `割当済み ${assignedCount}/${seatCount}席　空き ${seatCount - assignedCount}席　要確認 ${problemCount}席　（更新: ${updatedAt}）`,
       ],
       ["緑 = 割当済み　赤 = 要確認（予約一覧の赤いセルを確認）　白 = 空席"],
     ]);
   sheet.getRange(1, 1).setFontWeight("bold").setFontSize(14);
 
-  sheet
-    .getRange(SEAT_MAP_FIRST_ROW, 1, gridRows, SEAT_MAP_COLUMNS)
-    .setValues(values)
-    .setBackgrounds(backgrounds)
-    .setHorizontalAlignment("center")
-    .setVerticalAlignment("middle")
-    .setWrap(true)
-    .setBorder(true, true, true, true, true, true);
+  let row = SEAT_MAP_FIRST_ROW;
+
+  blockGrids.forEach(({ values, backgrounds }) => {
+    sheet
+      .getRange(row, 1, values.length, SEAT_MAP_COLUMNS)
+      .setValues(values)
+      .setBackgrounds(backgrounds)
+      .setHorizontalAlignment("center")
+      .setVerticalAlignment("middle")
+      .setWrap(true)
+      .setBorder(true, true, true, true, true, true);
+    sheet.setRowHeights(row, values.length, 45);
+    // ブロックの間は1行あける
+    row += values.length + 1;
+  });
 
   sheet.setColumnWidths(1, SEAT_MAP_COLUMNS, 90);
-  sheet.setRowHeights(SEAT_MAP_FIRST_ROW, gridRows, 45);
+}
+
+// ===== メール（席番号の通知・リマインド） =====
+
+/**
+ * メニューから実行: 席番号が入っていて、まだ通知していない「受付」の人に席番号を知らせる。
+ */
+function sendSeatNotices() {
+  const ui = SpreadsheetApp.getUi();
+  const { spreadsheet, masterSheet } = getMasterSheet();
+
+  prepareSeatColumn(masterSheet);
+  const { stageInfo, result } = refreshSeats(spreadsheet);
+
+  const { targets, skipped } = collectMailTargets(
+    masterSheet,
+    result,
+    stageInfo,
+    COLUMN_SEAT_NOTIFIED,
+    { requireSeats: true, stageFilter: () => true }
+  );
+  const skippedText = formatSkipped(skipped);
+
+  if (targets.length === 0) {
+    ui.alert("席番号の通知", `送る相手がいません。${skippedText}`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const quota = MailApp.getRemainingDailyQuota();
+  const quotaText =
+    targets.length > quota
+      ? `\n※今日送れるのは残り${quota}通です。残りは明日以降にもう一度実行してください。`
+      : "";
+  const answer = ui.alert(
+    "席番号の通知",
+    `${targets.length}件に席番号の通知メールを送ります。よろしいですか？${skippedText}${quotaText}`,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (answer !== ui.Button.OK) {
+    return;
+  }
+
+  const outcome = sendMailsWithLock(
+    masterSheet,
+    targets,
+    COLUMN_SEAT_NOTIFIED,
+    buildSeatNoticeMail
+  );
+
+  if (outcome === null) {
+    ui.alert("席番号の通知", "ほかのメール送信が実行中です。少し待ってからやり直してください。", ui.ButtonSet.OK);
+    return;
+  }
+
+  ui.alert("席番号の通知", formatOutcome(outcome), ui.ButtonSet.OK);
+}
+
+/**
+ * 時間主導トリガーから実行: 開催日の REMINDER_DAYS_BEFORE 日前〜前日のステージについて、
+ * まだリマインドしていない「受付」の人に送る。全ステージの開催日を過ぎたら自分のトリガーを削除する。
+ */
+function sendReminders() {
+  const today = Utilities.formatDate(new Date(), TIME_ZONE, "yyyy-MM-dd");
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const stageInfo = loadStages(spreadsheet);
+  const lastDateKey = stageInfo.stages
+    .map((stage) => stage.dateKey)
+    .sort()
+    .pop();
+
+  if (lastDateKey && today >= lastDateKey) {
+    deleteReminderTriggers();
+    console.log("最後のステージの開催日になったため、リマインドの自動送信を終了しました。");
+    return;
+  }
+
+  const activeStageNames = stageInfo.stages
+    .filter((stage) => stage.reminderKey <= today && today < stage.dateKey)
+    .map((stage) => stage.name);
+
+  if (activeStageNames.length === 0) {
+    return;
+  }
+
+  const result = validateSeats(masterSheet, stageInfo);
+  updateSeatMaps(spreadsheet, result, stageInfo);
+
+  const { targets, skipped } = collectMailTargets(
+    masterSheet,
+    result,
+    stageInfo,
+    COLUMN_REMINDED,
+    {
+      requireSeats: false,
+      stageFilter: (stage) => activeStageNames.includes(stage.name),
+    }
+  );
+
+  if (targets.length === 0 && Object.keys(skipped).length === 0) {
+    return;
+  }
+
+  const outcome = sendMailsWithLock(
+    masterSheet,
+    targets,
+    COLUMN_REMINDED,
+    buildReminderMail
+  );
+
+  if (outcome === null) {
+    console.warn("ほかのメール送信が実行中のため、リマインドは明日に回します。");
+    return;
+  }
+
+  const settingErrors =
+    stageInfo.errors.length > 0
+      ? `\n\nステージ設定の問題（この行のステージには送っていません）:\n${stageInfo.errors.join("\n")}`
+      : "";
+  const summary = `対象: ${activeStageNames.join("、")}\n${formatOutcome(outcome)}${formatSkipped(skipped)}${settingErrors}`;
+  console.log(`リマインド: ${summary}`);
+
+  // 実行したアカウントに結果を知らせる（未送信がある場合に気づけるように）
+  if (MailApp.getRemainingDailyQuota() < 1) {
+    return;
+  }
+
+  MailApp.sendEmail({
+    to: Session.getEffectiveUser().getEmail(),
+    subject: `【${EVENT_NAME}】リマインド送信結果 ${today}`,
+    body: `リマインドの送信結果です。\n\n${summary}\n\n送れなかった分は、直してから翌朝に自動で送られます（各ステージの開催日の前日まで）。\n${spreadsheet.getUrl()}`,
+    name: MAIL_SENDER_NAME,
+  });
+}
+
+/**
+ * メニューから実行: 通知とリマインドの見本を、実行したアカウント宛てに送る。
+ */
+function sendTestMails() {
+  const ui = SpreadsheetApp.getUi();
+  const stageInfo = loadStages(SpreadsheetApp.getActiveSpreadsheet());
+  const stage = stageInfo.stages[0];
+
+  if (!stage) {
+    ui.alert("テストメール", `「${STAGE_SHEET_NAME}」に正しく設定されたステージがありません。`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const to = Session.getEffectiveUser().getEmail();
+  const sample = {
+    name: "テスト 太郎",
+    email: to,
+    stage,
+    people: 2,
+    seatsText: formatSeats(stage.seats.slice(0, 2)),
+    reservationId: "TK-TEST",
+  };
+
+  [buildSeatNoticeMail(sample), buildReminderMail(sample)].forEach((mail) => {
+    MailApp.sendEmail({
+      to,
+      subject: `[テスト] ${mail.subject}`,
+      body: mail.body,
+      name: MAIL_SENDER_NAME,
+    });
+  });
+
+  ui.alert("テストメール", `${to} に見本を2通送りました。`, ui.ButtonSet.OK);
+}
+
+/**
+ * メニューから実行: 毎朝リマインドを確認するトリガーを作る（既存のものは作り直す）。
+ * メールは、これを実行したアカウントから送られる。
+ */
+function setupReminderTrigger() {
+  const ui = SpreadsheetApp.getUi();
+
+  deleteReminderTriggers();
+  ScriptApp.newTrigger("sendReminders")
+    .timeBased()
+    .everyDays(1)
+    .atHour(REMINDER_HOUR)
+    .create();
+
+  ui.alert(
+    "リマインドの自動送信",
+    `設定しました。各ステージの開催日の${REMINDER_DAYS_BEFORE}日前から前日まで、毎日${REMINDER_HOUR}時台に未送信の人へ送ります。\n送信元: ${Session.getEffectiveUser().getEmail()}`,
+    ui.ButtonSet.OK
+  );
+}
+
+function deleteReminderTriggers() {
+  ScriptApp.getProjectTriggers()
+    .filter((trigger) => trigger.getHandlerFunction() === "sendReminders")
+    .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+}
+
+function getMasterSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const masterSheet = spreadsheet.getSheetByName(MASTER_SHEET_NAME);
+
+  if (!masterSheet) {
+    throw new Error(`「${MASTER_SHEET_NAME}」シートが見つかりません。`);
+  }
+
+  return { spreadsheet, masterSheet };
+}
+
+/**
+ * メールを送る相手を集める。
+ * requireSeats が true なら席番号の入力が必要（通知用）。false なら未入力でも送る（リマインド用）。
+ * stageFilter が false を返すステージの行は対象外。席番号に問題がある行は、直すまで送らない。
+ */
+function collectMailTargets(masterSheet, result, stageInfo, sentColumn, options) {
+  const targets = [];
+  const skipped = {};
+  const skip = (reason) => {
+    skipped[reason] = (skipped[reason] || 0) + 1;
+  };
+
+  if (result.rows.length === 0) {
+    return { targets, skipped };
+  }
+
+  const sentValues = masterSheet
+    .getRange(2, sentColumn, result.rows.length, 1)
+    .getDisplayValues();
+
+  result.rows.forEach((rowValues, index) => {
+    if (rowValues[COLUMN_STATUS - 1] !== STATUS_ACCEPTED) {
+      return;
+    }
+
+    if (sentValues[index][0].trim() !== "") {
+      return;
+    }
+
+    const stage = stageInfo.byName[rowValues[COLUMN_STAGE - 1]];
+
+    if (!stage) {
+      skip("ステージがステージ設定にない（または設定に問題あり）");
+      return;
+    }
+
+    if (!options.stageFilter(stage)) {
+      return;
+    }
+
+    if (options.requireSeats && rowValues[COLUMN_SEAT - 1].trim() === "") {
+      skip("席番号が未入力");
+      return;
+    }
+
+    if (result.errorsByRow[index].length > 0) {
+      skip("席番号に問題あり（赤いセル）");
+      return;
+    }
+
+    const email = rowValues[COLUMN_EMAIL - 1].trim();
+
+    if (!EMAIL_PATTERN.test(email)) {
+      skip("メールアドレスが正しくない");
+      return;
+    }
+
+    targets.push({
+      rowNumber: index + 2,
+      name: rowValues[COLUMN_NAME - 1].trim(),
+      email,
+      stage,
+      people: rowValues[COLUMN_PEOPLE - 1],
+      seatsText: formatSeats(result.seatsByRow[index]),
+      reservationId: rowValues[COLUMN_RESERVATION_ID - 1],
+    });
+  });
+
+  return { targets, skipped };
+}
+
+/**
+ * 1件ずつ送り、送れたら送信日時を記録する（途中で止まっても二重に送らない）。
+ * ほかの送信が実行中なら null を返す。
+ * フォーム送信のロックとは別のロックを使い、送信中も予約の受付を止めない。
+ */
+function sendMailsWithLock(masterSheet, targets, sentColumn, buildMail) {
+  const lock = LockService.getDocumentLock();
+
+  if (!lock.tryLock(1000)) {
+    return null;
+  }
+
+  const outcome = { sent: 0, failed: 0, notSent: 0 };
+
+  try {
+    targets.forEach((target) => {
+      if (MailApp.getRemainingDailyQuota() < 1) {
+        outcome.notSent++;
+        return;
+      }
+
+      try {
+        const mail = buildMail(target);
+        MailApp.sendEmail({
+          to: target.email,
+          subject: mail.subject,
+          body: mail.body,
+          name: MAIL_SENDER_NAME,
+        });
+        masterSheet.getRange(target.rowNumber, sentColumn).setValue(new Date());
+        SpreadsheetApp.flush();
+        outcome.sent++;
+      } catch (error) {
+        // 個人情報は出さず、行番号だけを記録する
+        console.error(`${target.rowNumber}行目: メール送信に失敗しました: ${error}`);
+        outcome.failed++;
+      }
+    });
+  } finally {
+    lock.releaseLock();
+  }
+
+  return outcome;
+}
+
+/**
+ * 席番号の配列（並べ替え済み）を「1番、2番、A番」の形にする。
+ */
+function formatSeats(seats) {
+  return seats.map((seat) => `${seat}番`).join("、");
+}
+
+function formatOutcome(outcome) {
+  const lines = [`送信: ${outcome.sent}件`];
+
+  if (outcome.failed > 0) {
+    lines.push(`失敗: ${outcome.failed}件（実行ログを確認してください）`);
+  }
+
+  if (outcome.notSent > 0) {
+    lines.push(`送信上限のため未送信: ${outcome.notSent}件`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatSkipped(skipped) {
+  const entries = Object.entries(skipped);
+
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return `\n\n送らない人:\n${entries
+    .map(([reason, count]) => `・${reason}: ${count}件`)
+    .join("\n")}`;
+}
+
+function buildEventLines(target) {
+  return [
+    `■ ステージ: ${target.stage.name}`,
+    `■ 日時: ${target.stage.dateText} ${target.stage.time}`,
+    `■ 会場: ${VENUE_TEXT}`,
+    `■ 人数: ${target.people}名`,
+    `■ 席番号: ${target.seatsText || "当日受付でご案内します"}`,
+    `■ 予約ID: ${target.reservationId}`,
+  ].join("\n");
+}
+
+function buildMailFooter() {
+  const cancelLines = ["キャンセルの場合は、キャンセルフォームからお手続きください。"];
+
+  if (CANCEL_FORM_URL) {
+    cancelLines.push(CANCEL_FORM_URL);
+  }
+
+  return `${cancelLines.join("\n")}\n\n${MAIL_SENDER_NAME}`;
+}
+
+function buildSeatNoticeMail(target) {
+  return {
+    subject: `【${EVENT_NAME}】席番号のお知らせ（${target.stage.name}）`,
+    body: [
+      `${target.name} 様`,
+      "",
+      `${EVENT_NAME}にお申し込みいただき、ありがとうございます。`,
+      "お席が決まりましたので、お知らせします。",
+      "",
+      buildEventLines(target),
+      "",
+      "当日のご来場を心よりお待ちしております。",
+      "",
+      buildMailFooter(),
+    ].join("\n"),
+  };
+}
+
+function buildReminderMail(target) {
+  return {
+    subject: `【${EVENT_NAME}】ご来場のご案内（${target.stage.name}）`,
+    body: [
+      `${target.name} 様`,
+      "",
+      `${EVENT_NAME}の開催日が近づいてまいりましたので、ご案内いたします。`,
+      "",
+      buildEventLines(target),
+      "",
+      "皆さまのご来場を心よりお待ちしております。",
+      "",
+      buildMailFooter(),
+    ].join("\n"),
+  };
 }
