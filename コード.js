@@ -80,6 +80,9 @@ const SEAT_RELATED_COLUMNS = [
   COLUMN_SEAT,
 ];
 
+// 登録日時と申込日時の差がこの範囲なら、同じ回答とみなす（ミリ秒）
+const SAME_RESPONSE_WINDOW_MS = 10 * 60 * 1000;
+
 // 同時送信時にロック解放を待つ最大時間（ミリ秒）
 const LOCK_TIMEOUT_MS = 30000;
 
@@ -153,9 +156,43 @@ function onReservationSubmit(e) {
   }
 
   const row = e.range.getRow();
-
   const answer = (questionTitle) =>
     (e.namedValues[questionTitle] || [""])[0].trim();
+  const submittedAt = getSubmittedAt(responseSheet, row);
+
+  // 同時送信で確認をすり抜けないよう、確認〜追記を排他制御する
+  const lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_TIMEOUT_MS);
+
+  let outcome;
+
+  try {
+    const existingRows = getExistingRows(masterSheet);
+    outcome = registerReservation(masterSheet, existingRows, stage, responseSheetName, row, answer, submittedAt);
+    // ロック解放前に書き込みを確定させ、次の実行が最新の行を読めるようにする
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+
+  if (outcome.error) {
+    throw new Error(outcome.error);
+  }
+
+  if (outcome.reachedCapacity) {
+    closeForm(responseSheet, stage.name);
+  }
+}
+
+/**
+ * 回答シートの1行を「予約一覧」に登録する（呼び出し側でスクリプトロックを取る）。
+ * existingRows には追記した行も加える（続けて登録するときの定員計算のため）。
+ * 戻り値: skipped（登録済み）、error（登録できない理由）、status、reachedCapacity（定員に達したか）
+ */
+function registerReservation(masterSheet, existingRows, stage, responseSheetName, row, answer, submittedAt) {
+  if (isAlreadyAdded(existingRows, responseSheetName, row, submittedAt)) {
+    return { skipped: true };
+  }
 
   // 入力は必須のため、空欄はフォームの質問タイトル変更などの設定ミスを意味する
   const missingQuestions = REQUIRED_QUESTIONS.filter(
@@ -172,73 +209,209 @@ function onReservationSubmit(e) {
   const people = parsePeopleCount(answer(QUESTION_PEOPLE));
 
   if (people === null) {
-    throw new Error(
-      `${responseSheetName} ${row}行目: 申込人数が正の整数ではありません。フォームの入力制限を確認してください。`
-    );
+    return {
+      error: `${responseSheetName} ${row}行目: 申込人数が正の整数ではありません。フォームの入力制限を確認してください。`,
+    };
   }
 
-  // 同時送信で確認をすり抜けないよう、確認〜追記を排他制御する
+  const reservedPeople = countReservedPeople(existingRows, stage.name);
+  const remaining = Math.max(stage.capacity - reservedPeople, 0);
+
+  // 定員を超える申込は受け付けない
+  const isRejected = people > remaining;
+  const status = isRejected ? STATUS_REJECTED : STATUS_ACCEPTED;
+  const note = isRejected
+    ? `定員超過（申込${people}名／残り${remaining}名）`
+    : "";
+
+  if (isRejected) {
+    // 個人情報は出さず、シート名・行番号・理由だけを記録する
+    console.warn(`${responseSheetName} ${row}行目: ${status} ${note}`);
+  }
+
+  const newRow = [
+    submittedAt,
+    `TK-${Utilities.getUuid()}`,
+    stage.name,
+    answer(QUESTION_NAME),
+    answer(QUESTION_EMAIL),
+    answer(QUESTION_PEOPLE),
+    status,
+    note,
+    responseSheetName,
+    row,
+  ];
+
+  masterSheet.appendRow(newRow);
+  existingRows.push(newRow);
+
+  const addedPeople = isRejected ? 0 : people;
+  return { status, reachedCapacity: reservedPeople + addedPeople >= stage.capacity };
+}
+
+/**
+ * 回答シートの行の申込日時（A列のタイムスタンプ）。読めなければ今の日時。
+ */
+function getSubmittedAt(responseSheet, row) {
+  const value = responseSheet.getRange(row, 1).getValue();
+  return Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())
+    ? value
+    : new Date();
+}
+
+/**
+ * 同じ回答を登録済みか。元シート名・元行番号が同じで、登録日時が申込日時に近い行があれば登録済みとする。
+ * （回答シートの行を消すと、新しい回答が前と同じ行番号に入るため、行番号だけでは判断しない）
+ */
+function isAlreadyAdded(existingRows, responseSheetName, row, submittedAt) {
+  return existingRows.some((existingRow) => {
+    if (
+      existingRow[COLUMN_SOURCE_SHEET - 1] !== responseSheetName ||
+      Number(existingRow[COLUMN_SOURCE_ROW - 1]) !== row
+    ) {
+      return false;
+    }
+
+    const registeredAt = existingRow[0];
+
+    // 登録日時が日付でなければ、念のため登録済みとみなす（二重登録を避ける）
+    if (Object.prototype.toString.call(registeredAt) !== "[object Date]") {
+      return true;
+    }
+
+    return Math.abs(registeredAt.getTime() - submittedAt.getTime()) <= SAME_RESPONSE_WINDOW_MS;
+  });
+}
+
+/**
+ * メニューから実行: 回答シートにあるのに「予約一覧」に載っていない回答を、申込日時の順に登録する。
+ * （トリガーが止まっていた間の回答や、行番号の誤判定で飛ばされた回答を取り込む）
+ */
+function importMissedResponses() {
+  const ui = SpreadsheetApp.getUi();
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const stageInfo = loadStages(spreadsheet);
+  const findMissed = (existingRows) => {
+    const missed = [];
+
+    stageInfo.stages.forEach((stage) => {
+      const sheet = spreadsheet.getSheetByName(stage.responseSheet);
+
+      if (!sheet || sheet.getLastRow() < 2) {
+        return;
+      }
+
+      const range = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn());
+      const values = range.getValues();
+      const displayValues = range.getDisplayValues();
+      const headers = displayValues[0].map((header) => header.trim());
+
+      values.slice(1).forEach((rowValues, index) => {
+        const submittedAt = rowValues[0];
+        const row = index + 2;
+
+        if (Object.prototype.toString.call(submittedAt) !== "[object Date]") {
+          return;
+        }
+
+        if (!isAlreadyAdded(existingRows, stage.responseSheet, row, submittedAt)) {
+          const texts = displayValues[index + 1];
+          missed.push({
+            stage,
+            row,
+            submittedAt,
+            answer: (title) => {
+              const column = headers.indexOf(title);
+              return column < 0 ? "" : String(texts[column]).trim();
+            },
+          });
+        }
+      });
+    });
+
+    return missed.sort((a, b) => a.submittedAt - b.submittedAt);
+  };
+
+  const preview = findMissed(getExistingRows(masterSheet));
+
+  if (preview.length === 0) {
+    const errorsText = stageInfo.errors.length > 0 ? `\n\n※次の行は設定に問題があるため、確認していません。\n${stageInfo.errors.join("\n")}` : "";
+    ui.alert("取りこぼした回答を取り込む", `取りこぼした回答はありません。${errorsText}`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const counts = {};
+  preview.forEach((item) => {
+    counts[item.stage.name] = (counts[item.stage.name] || 0) + 1;
+  });
+
+  const answer = ui.alert(
+    "取りこぼした回答を取り込む",
+    `予約一覧に載っていない回答が${preview.length}件あります。\n${Object.entries(counts)
+      .map(([name, count]) => `・${name}: ${count}件`)
+      .join("\n")}\n\n申込日時の順に、定員を確かめながら登録します（定員を超える分は「${STATUS_REJECTED}」になります）。よろしいですか？`,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (answer !== ui.Button.OK) {
+    return;
+  }
+
   const lock = LockService.getScriptLock();
   lock.waitLock(LOCK_TIMEOUT_MS);
 
-  let shouldCloseForm = false;
+  const summary = { [STATUS_ACCEPTED]: 0, [STATUS_REJECTED]: 0 };
+  const errors = [];
+  const fullStages = new Set();
 
   try {
+    // ロックを取った後に読み直す（確認中に届いた回答と二重にならないように）
     const existingRows = getExistingRows(masterSheet);
 
-    // 同じ回答行を二重に登録しないための確認
-    const alreadyAdded = existingRows.some(
-      (existingRow) =>
-        existingRow[COLUMN_SOURCE_SHEET - 1] === responseSheetName &&
-        Number(existingRow[COLUMN_SOURCE_ROW - 1]) === row
-    );
+    findMissed(existingRows).forEach((item) => {
+      const outcome = registerReservation(
+        masterSheet,
+        existingRows,
+        item.stage,
+        item.stage.responseSheet,
+        item.row,
+        item.answer,
+        item.submittedAt
+      );
 
-    if (alreadyAdded) {
-      return;
-    }
+      if (outcome.error) {
+        errors.push(outcome.error);
+      } else if (!outcome.skipped) {
+        summary[outcome.status]++;
 
-    const reservedPeople = countReservedPeople(existingRows, stage.name);
-    const remaining = Math.max(stage.capacity - reservedPeople, 0);
+        if (outcome.reachedCapacity) {
+          fullStages.add(item.stage);
+        }
+      }
+    });
 
-    // 定員を超える申込は受け付けない
-    const isRejected = people > remaining;
-    const status = isRejected ? STATUS_REJECTED : STATUS_ACCEPTED;
-    const note = isRejected
-      ? `定員超過（申込${people}名／残り${remaining}名）`
-      : "";
-
-    if (isRejected) {
-      // 個人情報は出さず、シート名・行番号・理由だけを記録する
-      console.warn(`${responseSheetName} ${row}行目: ${status} ${note}`);
-    }
-
-    const reservationId = `TK-${Utilities.getUuid()}`;
-
-    masterSheet.appendRow([
-      new Date(),
-      reservationId,
-      stage.name,
-      answer(QUESTION_NAME),
-      answer(QUESTION_EMAIL),
-      answer(QUESTION_PEOPLE),
-      status,
-      note,
-      responseSheetName,
-      row,
-    ]);
-
-    // ロック解放前に書き込みを確定させ、次の実行が最新の行を読めるようにする
     SpreadsheetApp.flush();
-
-    const addedPeople = isRejected ? 0 : people;
-    shouldCloseForm = reservedPeople + addedPeople >= stage.capacity;
   } finally {
     lock.releaseLock();
   }
 
-  if (shouldCloseForm) {
-    closeForm(responseSheet, stage.name);
+  fullStages.forEach((stage) => {
+    closeForm(spreadsheet.getSheetByName(stage.responseSheet), stage.name);
+  });
+
+  try {
+    refreshSeats(spreadsheet);
+  } catch (error) {
+    console.error(`取り込み後の座席表の更新に失敗しました: ${error}`);
   }
+
+  ui.alert(
+    "取りこぼした回答を取り込む",
+    `登録しました。\n・${STATUS_ACCEPTED}: ${summary[STATUS_ACCEPTED]}件\n・${STATUS_REJECTED}（定員超過）: ${summary[STATUS_REJECTED]}件${
+      fullStages.size > 0 ? `\n\n定員に達したためフォームを締め切りました: ${[...fullStages].map((stage) => stage.name).join("、")}` : ""
+    }${errors.length > 0 ? `\n\n登録できなかった回答:\n${errors.join("\n")}` : ""}`,
+    ui.ButtonSet.OK
+  );
 }
 
 /**
@@ -571,9 +744,11 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("予約管理")
     .addItem("席番号をチェック・座席表を更新", "checkAllSeats")
+    .addItem("取りこぼした回答を取り込む", "importMissedResponses")
     .addItem("定員の状況をログに出す", "showCapacityStatus")
     .addSeparator()
     .addItem("席番号の通知メールを送る", "sendSeatNotices")
+    .addItem("選んだ行にメールを送る", "showSelectedMailDialog")
     .addItem("テストメールを自分に送る", "sendTestMails")
     .addItem("リマインドの自動送信を設定", "setupReminderTrigger")
     .addSeparator()
@@ -1270,7 +1445,12 @@ function sendMailsWithLock(masterSheet, targets, sentColumn, buildMail) {
           body: mail.body,
           name: MAIL_SENDER_NAME,
         });
-        masterSheet.getRange(target.rowNumber, sentColumn).setValue(new Date());
+        // sentColumn は記録する列の番号、または記録する処理（関数）
+        if (typeof sentColumn === "function") {
+          sentColumn(target);
+        } else {
+          masterSheet.getRange(target.rowNumber, sentColumn).setValue(new Date());
+        }
         SpreadsheetApp.flush();
         outcome.sent++;
       } catch (error) {
@@ -1575,16 +1755,21 @@ function onCancelSubmit(e) {
   let logRow;
 
   try {
-    // 同じ回答を二重に処理しないための確認
-    const processedRows =
-      logSheet.getLastRow() >= 2
-        ? logSheet
-            .getRange(2, CANCEL_LOG_COLUMN_RESPONSE_ROW, logSheet.getLastRow() - 1, 1)
-            .getValues()
-            .map((row) => Number(row[0]))
-        : [];
+    // 同じ回答を二重に処理しないための確認（行を消して行番号が再利用された場合は別の回答とみなす）
+    const submittedAt = getSubmittedAt(e.range.getSheet(), responseRow);
+    const processed =
+      logSheet.getLastRow() >= 2 &&
+      logSheet
+        .getRange(2, 1, logSheet.getLastRow() - 1, CANCEL_LOG_COLUMN_RESPONSE_ROW)
+        .getValues()
+        .some(
+          ([processedAt, row]) =>
+            Number(row) === responseRow &&
+            (Object.prototype.toString.call(processedAt) !== "[object Date]" ||
+              Math.abs(processedAt.getTime() - submittedAt.getTime()) <= SAME_RESPONSE_WINDOW_MS)
+        );
 
-    if (processedRows.includes(responseRow)) {
+    if (processed) {
       return;
     }
 
@@ -2025,9 +2210,11 @@ function buildUsageLines() {
     [""],
     ["h", "5. メニュー「予約管理」"],
     ["th", "メニュー", "すること", "使うアカウント"],
+    ["t", "取りこぼした回答を取り込む", "回答シートにあるのに予約一覧に載っていない申込を、申込日時の順に登録する（定員も確認する）", "だれでも"],
     ["t", "席番号をチェック・座席表を更新", "全件の席番号をチェックし、座席表シートを作り直す", "だれでも"],
     ["t", "定員の状況をログに出す", "ステージごとの予約人数を実行ログに出す（担当者向け）", "だれでも"],
     ["t", "席番号の通知メールを送る", "席番号が入っていて、まだ通知していない「受付」の人に送る。送る前に件数の確認が出る", "団体のアカウント"],
+    ["t", "選んだ行にメールを送る", "予約一覧で選んだ行の人に、席番号の通知・リマインド・お知らせ（自由に書く）・キャンセル完了のどれかを送る。送信済みの人にも送れる", "団体のアカウント"],
     ["t", "テストメールを自分に送る", "通知とリマインドの見本を、実行した人に送る", "団体のアカウント"],
     ["t", "リマインドの自動送信を設定", "毎朝のリマインドを開始する。本番前に1回だけ実行", "団体のアカウント"],
     ["t", "キャンセルフォームを作成・更新", "1回目はキャンセルフォームを作る。2回目からはステージの選択肢を最新にする", "担当者"],
@@ -2038,7 +2225,8 @@ function buildUsageLines() {
     ["h", "6. よくある作業"],
     ["th", "やりたいこと", "手順", "注意"],
     ["t", "席番号を知らせる", `K列に席番号を入力 → 赤いセルがないか確認 → メニュー「席番号の通知メールを送る」`, "赤いセルの人には送られません。直してからもう一度実行"],
-    ["t", "通知・リマインドを送り直す", "その人の L列（通知）または M列（リマインド）を空にして、もう一度送る", "席番号を変えても自動では送り直されません"],
+    ["t", "特定の人にメールを送る・送り直す", "予約一覧で送りたい人の行を選ぶ（Ctrl+クリックで複数） → メニュー「選んだ行にメールを送る」 → 種類を選んで「確認する」 → 見本を確かめて「送信する」", "ステージ全員に送るときは、C列でフィルタしてから行を選ぶ。席番号を変えても自動では送り直されません"],
+    ["t", "全員にお知らせを送る（時間変更など）", "「選んだ行にメールを送る」で「お知らせ（自由に書く）」を選び、件名と本文を書く", "送れるのは「受付」の人だけ。送った記録はH列のメモに残る"],
     ["t", "電話などでキャンセルを受けた", `G列を「${STATUS_CANCELLED}」にし、K列の席番号を消す。H列に日付と理由をメモ`, "締め切ったフォームは自動で再開しません。再開するならフォームの「回答を受付中」をオンにする"],
     ["t", "人数を減らしたい", "F列の人数を直し、K列の席番号もその数に合わせる", "席番号を変えたら L列を空にして通知を送り直す"],
     ["t", "「要確認: キャンセルを自動で処理できませんでした」のメールが来た", `「${CANCEL_LOG_SHEET_NAME}」で内容を確認 → 予約一覧を手で直す → お客様に連絡`, "このときお客様には自動のメールは送られていません"],
@@ -2055,7 +2243,7 @@ function buildUsageLines() {
     [""],
     ["h", "8. 困ったとき"],
     ["th", "困りごと", "考えられる原因", "対処"],
-    ["t", "申込が予約一覧に載らない", "ステージ設定の誤り、フォームの質問タイトル・タブ名の変更、権限の承認切れ", "回答シートには残っています。メニュー「席番号をチェック・座席表を更新」で設定の問題が表示されます。直らなければ担当者に連絡"],
+    ["t", "申込が予約一覧に載らない", "ステージ設定の誤り、フォームの質問タイトル・タブ名の変更、権限の承認切れ", "回答シートには残っています。メニュー「席番号をチェック・座席表を更新」で設定の問題が表示されます。原因を直したら、メニュー「取りこぼした回答を取り込む」で登録できます。直らなければ担当者に連絡"],
     ["t", "メールが一部送れない", "1日の送信上限（無料Gmail 約100通、Google Workspace 約1,500通）", "翌日にもう一度メニューを実行する（送った人には二重に送られません）"],
     ["t", "座席表が古い", "自動で作り直すのは予約一覧やステージ設定を編集したとき", "メニュー「席番号をチェック・座席表を更新」"],
     ["t", "メニュー「予約管理」が出ない", "読み込みの途中", "スプレッドシートを再読み込みする（F5）"],
@@ -2127,4 +2315,386 @@ function rebuildUsageSheet() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   writeUsageSheet(spreadsheet).activate();
   spreadsheet.toast("使い方シートを作り直しました。", "使い方", 5);
+}
+
+// ===== 選んだ行にメールを送る =====
+
+const SELECTED_MAIL_TYPES = {
+  seat: "席番号の通知",
+  reminder: "リマインド",
+  notice: "お知らせ（自由に書く）",
+  cancel: "キャンセル完了のお知らせ",
+};
+const SELECTED_MAIL_MAX_ROWS = 300;
+
+/**
+ * メニューから実行: 「予約一覧」で選んだ行の人に、種類を選んでメールを送る画面を出す。
+ * 送信済みの人にも送れる（送り直し）。
+ */
+function showSelectedMailDialog() {
+  const ui = SpreadsheetApp.getUi();
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const activeSheet = spreadsheet.getActiveSheet();
+
+  if (activeSheet.getName() !== MASTER_SHEET_NAME) {
+    ui.alert("選んだ行にメールを送る", `「${MASTER_SHEET_NAME}」シートで、送りたい人の行を選んでから実行してください。`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const lastRow = masterSheet.getLastRow();
+  const rowNumbers = new Set();
+
+  activeSheet
+    .getActiveRangeList()
+    .getRanges()
+    .forEach((range) => {
+      for (let row = range.getRow(); row <= range.getLastRow(); row++) {
+        if (row >= 2 && row <= lastRow) {
+          rowNumbers.add(row);
+        }
+      }
+    });
+
+  if (rowNumbers.size === 0) {
+    ui.alert("選んだ行にメールを送る", "送りたい人の行（2行目以降）を選んでから実行してください。\nCtrl を押しながらクリックすると、離れた行もまとめて選べます。", ui.ButtonSet.OK);
+    return;
+  }
+
+  if (rowNumbers.size > SELECTED_MAIL_MAX_ROWS) {
+    ui.alert("選んだ行にメールを送る", `一度に選べるのは${SELECTED_MAIL_MAX_ROWS}行までです。`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const sortedRows = [...rowNumbers].sort((a, b) => a - b);
+  const values = masterSheet
+    .getRange(2, 1, lastRow - 1, COLUMN_STATUS)
+    .getDisplayValues();
+  const selections = sortedRows.map((rowNumber) => {
+    const rowValues = values[rowNumber - 2];
+    return {
+      rowNumber,
+      reservationId: rowValues[COLUMN_RESERVATION_ID - 1],
+      name: rowValues[COLUMN_NAME - 1],
+      stage: rowValues[COLUMN_STAGE - 1],
+      status: rowValues[COLUMN_STATUS - 1],
+    };
+  });
+
+  const html = HtmlService.createHtmlOutput(buildSelectedMailDialogHtml(selections))
+    .setWidth(640)
+    .setHeight(640);
+  ui.showModalDialog(html, `選んだ行にメールを送る（${selections.length}行）`);
+}
+
+/**
+ * 画面の「確認する」から呼ばれる: 送る人・送らない人と、1通目の見本を返す（まだ送らない）。
+ */
+function previewSelectedMails(type, selections, custom) {
+  const { targets, skipped } = collectSelectedTargets(type, selections);
+  const buildMail = getSelectedMailBuilder(type, custom);
+  const sample = targets.length > 0 ? buildMail(targets[0]) : null;
+
+  return {
+    targets: targets.map((target) => `${target.rowNumber}行目 ${target.name}（${target.stageName}）`),
+    skipped,
+    sample,
+    quota: MailApp.getRemainingDailyQuota(),
+  };
+}
+
+/**
+ * 画面の「送信する」から呼ばれる: 送って、結果の文を返す。
+ * 席番号の通知・リマインドは L列・M列に日時を書く。お知らせ・キャンセル完了は H列のメモに記録する。
+ */
+function sendSelectedMails(type, selections, custom) {
+  const { masterSheet } = getMasterSheet();
+  const { targets, skipped } = collectSelectedTargets(type, selections);
+  const buildMail = getSelectedMailBuilder(type, custom);
+
+  if (targets.length === 0) {
+    return `送る相手がいません。${formatSelectedSkipped(skipped)}`;
+  }
+
+  const stamp = () => Utilities.formatDate(new Date(), TIME_ZONE, "M/d HH:mm");
+  const record = {
+    seat: COLUMN_SEAT_NOTIFIED,
+    reminder: COLUMN_REMINDED,
+    notice: (target) =>
+      appendMemo(masterSheet, target.rowNumber, `${stamp()} お知らせ送信「${custom.subject}」`),
+    cancel: (target) =>
+      appendMemo(masterSheet, target.rowNumber, `${stamp()} キャンセル完了メールを送信`),
+  }[type];
+  const outcome = sendMailsWithLock(masterSheet, targets, record, buildMail);
+
+  if (outcome === null) {
+    return "ほかのメール送信が実行中です。少し待ってからやり直してください。";
+  }
+
+  return `${SELECTED_MAIL_TYPES[type]}\n${formatOutcome(outcome)}${formatSelectedSkipped(skipped)}`;
+}
+
+/**
+ * 選んだ行から、メールの種類ごとに送れる人を集める。
+ * selections の予約IDで行を確かめる（画面を開いた後に行がずれた場合は送らない）。
+ */
+function collectSelectedTargets(type, selections) {
+  if (!SELECTED_MAIL_TYPES[type]) {
+    throw new Error("メールの種類が正しくありません。");
+  }
+
+  const { spreadsheet, masterSheet } = getMasterSheet();
+  const stageInfo = loadStages(spreadsheet);
+  const result = validateSeats(masterSheet, stageInfo);
+  const partialCancels = type === "cancel" ? readPartialCancels(spreadsheet) : {};
+  const targets = [];
+  const skipped = [];
+
+  selections.forEach(({ rowNumber, reservationId }) => {
+    const index = rowNumber - 2;
+    const rowValues = result.rows[index];
+    const skip = (reason) =>
+      skipped.push(`${rowNumber}行目${rowValues ? ` ${rowValues[COLUMN_NAME - 1]}` : ""}: ${reason}`);
+
+    if (!rowValues || rowValues[COLUMN_RESERVATION_ID - 1] !== reservationId) {
+      skip("画面を開いた後に行がずれました。画面を開き直してください");
+      return;
+    }
+
+    const status = rowValues[COLUMN_STATUS - 1];
+    const stageName = rowValues[COLUMN_STAGE - 1];
+    const stage = stageInfo.byName[stageName];
+    const email = rowValues[COLUMN_EMAIL - 1].trim();
+    const people = parsePeopleCount(rowValues[COLUMN_PEOPLE - 1]);
+
+    if (!EMAIL_PATTERN.test(email)) {
+      skip("メールアドレスが正しくない");
+      return;
+    }
+
+    const target = {
+      rowNumber,
+      name: rowValues[COLUMN_NAME - 1].trim(),
+      email,
+      stage,
+      stageName,
+      people: rowValues[COLUMN_PEOPLE - 1],
+      seatsText: formatSeats(result.seatsByRow[index]),
+      reservationId,
+    };
+
+    if (type === "cancel") {
+      if (status === STATUS_CANCELLED) {
+        targets.push({ ...target, cancelCount: people || target.people, remaining: 0, hadSeats: false });
+      } else if (status === STATUS_ACCEPTED && partialCancels[reservationId]) {
+        targets.push({
+          ...target,
+          cancelCount: partialCancels[reservationId],
+          remaining: people || target.people,
+          hadSeats: false,
+        });
+      } else if (status === STATUS_ACCEPTED) {
+        skip(`キャンセルの記録がありません（「${CANCEL_LOG_SHEET_NAME}」に一部キャンセルの記録がない「受付」の予約）`);
+      } else {
+        skip(`状態が「${status}」`);
+      }
+      return;
+    }
+
+    if (status !== STATUS_ACCEPTED) {
+      skip(`状態が「${status}」（「${STATUS_ACCEPTED}」の人にだけ送れます）`);
+      return;
+    }
+
+    if (!stage) {
+      skip("ステージがステージ設定にない（または設定に問題あり）");
+      return;
+    }
+
+    if (result.errorsByRow[index].length > 0) {
+      skip("席番号に問題あり（赤いセル）");
+      return;
+    }
+
+    if (type === "seat" && rowValues[COLUMN_SEAT - 1].trim() === "") {
+      skip("席番号が未入力");
+      return;
+    }
+
+    targets.push(target);
+  });
+
+  return { targets, skipped };
+}
+
+/**
+ * 「キャンセル処理結果」から、一部キャンセルの人数を予約IDごとに返す（同じ予約の最新の記録）。
+ */
+function readPartialCancels(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName(CANCEL_LOG_SHEET_NAME);
+  const counts = {};
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return counts;
+  }
+
+  sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, CANCEL_LOG_HEADERS.length)
+    .getDisplayValues()
+    .forEach((row) => {
+      const reservationId = row[7];
+      const count = parsePeopleCount(row[4]);
+
+      if (reservationId && count !== null && row[5].startsWith("一部キャンセル")) {
+        counts[reservationId] = count;
+      }
+    });
+
+  return counts;
+}
+
+function getSelectedMailBuilder(type, custom) {
+  if (type === "seat") {
+    return buildSeatNoticeMail;
+  }
+
+  if (type === "reminder") {
+    return buildReminderMail;
+  }
+
+  if (type === "cancel") {
+    return (target) => buildCancelMail(target, target.stage);
+  }
+
+  const subject = String((custom && custom.subject) || "").trim();
+  const body = String((custom && custom.body) || "").trim();
+
+  if (subject === "" || body === "") {
+    throw new Error("お知らせの件名と本文を入力してください。");
+  }
+
+  return (target) => ({
+    subject,
+    body: [
+      `${target.name} 様`,
+      "",
+      body,
+      "",
+      ...(custom.includeInfo ? ["【ご予約の内容】", buildEventLines(target), ""] : []),
+      buildMailFooter(),
+    ].join("\n"),
+  });
+}
+
+function appendMemo(masterSheet, rowNumber, text) {
+  const cell = masterSheet.getRange(rowNumber, COLUMN_MEMO);
+  const oldMemo = cell.getDisplayValue().trim();
+  cell.setValue(oldMemo ? `${oldMemo}\n${text}` : text);
+}
+
+function formatSelectedSkipped(skipped) {
+  return skipped.length > 0 ? `\n\n送らない人（${skipped.length}件）:\n${skipped.join("\n")}` : "";
+}
+
+function buildSelectedMailDialogHtml(selections) {
+  // </script> などで HTML が壊れないよう、< をエスケープして埋め込む
+  const data = JSON.stringify({
+    selections,
+    types: SELECTED_MAIL_TYPES,
+    defaultSubject: `【${EVENT_NAME}】お知らせ`,
+  }).replace(/</g, "\\u003c");
+
+  return `<!DOCTYPE html>
+<html><head><base target="_top"><style>
+  body { font-family: sans-serif; font-size: 13px; margin: 0; }
+  h3 { font-size: 13px; margin: 12px 0 4px; }
+  .box { border: 1px solid #ddd; padding: 6px 8px; max-height: 110px; overflow-y: auto; font-size: 12px; }
+  label { display: block; margin: 2px 0; }
+  input[type=text], textarea { width: 100%; box-sizing: border-box; font-size: 13px; }
+  textarea { height: 110px; }
+  pre { white-space: pre-wrap; background: #f6f6f6; padding: 8px; font-size: 12px; max-height: 180px; overflow-y: auto; }
+  .warn { color: #c00; }
+  .hidden { display: none; }
+  button { padding: 6px 14px; margin-top: 10px; cursor: pointer; }
+  #send { font-weight: bold; }
+</style></head><body>
+<h3>選んだ人</h3>
+<div class="box" id="selected"></div>
+<h3>送るメール</h3>
+<div id="types"></div>
+<div id="notice" class="hidden">
+  <h3>件名</h3><input type="text" id="subject">
+  <h3>本文（先頭に「○○ 様」、最後にキャンセルフォームの案内と差出人が自動で入ります）</h3>
+  <textarea id="body"></textarea>
+  <label><input type="checkbox" id="includeInfo" checked> 本文の下に予約の内容（ステージ・日時・会場・人数・席番号・予約ID）を付ける</label>
+</div>
+<button id="preview">確認する</button>
+<div id="result" class="hidden">
+  <h3 id="targetTitle"></h3><div class="box" id="targets"></div>
+  <div id="skippedArea"><h3 class="warn" id="skippedTitle"></h3><div class="box" id="skipped"></div></div>
+  <h3>見本（1人目）</h3><pre id="sample"></pre>
+  <div class="warn" id="quota"></div>
+  <button id="send">送信する</button>
+</div>
+<pre id="done" class="hidden"></pre>
+<script>
+  const data = ${data};
+  const $ = (id) => document.getElementById(id);
+  const selected = $("selected");
+  data.selections.forEach((s) => {
+    const div = document.createElement("div");
+    div.textContent = s.rowNumber + "行目 " + s.name + "（" + s.stage + "・" + s.status + "）";
+    selected.appendChild(div);
+  });
+  Object.entries(data.types).forEach(([value, label], i) => {
+    const wrap = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "radio"; input.name = "type"; input.value = value; input.checked = i === 0;
+    input.onchange = changed;
+    wrap.appendChild(input);
+    wrap.appendChild(document.createTextNode(" " + label));
+    $("types").appendChild(wrap);
+  });
+  $("subject").value = data.defaultSubject;
+  ["subject", "body", "includeInfo"].forEach((id) => $(id).oninput = changed);
+  $("includeInfo").onchange = changed;
+  function type() { return document.querySelector("input[name=type]:checked").value; }
+  function custom() { return { subject: $("subject").value, body: $("body").value, includeInfo: $("includeInfo").checked }; }
+  function list(box, items) {
+    box.textContent = "";
+    items.forEach((item) => { const div = document.createElement("div"); div.textContent = item; box.appendChild(div); });
+  }
+  // 内容を変えたら、確認し直すまで送れないようにする
+  function changed() {
+    $("notice").classList.toggle("hidden", type() !== "notice");
+    $("result").classList.add("hidden");
+  }
+  function busy(on) { $("preview").disabled = on; $("send").disabled = on; }
+  function fail(error) { busy(false); alert(error.message || error); }
+  $("preview").onclick = () => {
+    busy(true);
+    google.script.run.withFailureHandler(fail).withSuccessHandler((res) => {
+      busy(false);
+      $("targetTitle").textContent = "送る人（" + res.targets.length + "名）";
+      list($("targets"), res.targets);
+      $("skippedArea").classList.toggle("hidden", res.skipped.length === 0);
+      $("skippedTitle").textContent = "送らない人（" + res.skipped.length + "名）";
+      list($("skipped"), res.skipped);
+      $("sample").textContent = res.sample ? "件名: " + res.sample.subject + "\\n\\n" + res.sample.body : "（送る人がいません）";
+      $("quota").textContent = res.targets.length > res.quota ? "今日送れるのは残り" + res.quota + "通です。残りは送られません。" : "";
+      $("send").textContent = res.targets.length + "名に送信する";
+      $("send").disabled = res.targets.length === 0;
+      $("result").classList.remove("hidden");
+    }).previewSelectedMails(type(), data.selections, custom());
+  };
+  $("send").onclick = () => {
+    busy(true);
+    google.script.run.withFailureHandler(fail).withSuccessHandler((message) => {
+      $("result").classList.add("hidden");
+      $("preview").classList.add("hidden");
+      $("done").textContent = message + "\\n\\nこの画面は閉じてかまいません。";
+      $("done").classList.remove("hidden");
+    }).sendSelectedMails(type(), data.selections, custom());
+  };
+</script>
+</body></html>`;
 }
