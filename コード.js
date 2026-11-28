@@ -2343,20 +2343,33 @@ function showSelectedMailDialog() {
 
   const lastRow = masterSheet.getLastRow();
   const rowNumbers = new Set();
+  const ranges = activeSheet.getActiveRangeList().getRanges();
+  let hiddenCount = 0;
 
-  activeSheet
-    .getActiveRangeList()
-    .getRanges()
-    .forEach((range) => {
-      for (let row = range.getRow(); row <= range.getLastRow(); row++) {
-        if (row >= 2 && row <= lastRow) {
-          rowNumbers.add(row);
-        }
+  // 列全体（列の見出しをクリック）を選ぶと全員が対象になるため、止める
+  if (ranges.some((range) => range.getRow() === 1 && range.getLastRow() === activeSheet.getMaxRows())) {
+    ui.alert("選んだ行にメールを送る", "列全体が選ばれています（列の見出しの A、B… をクリックすると、全員が選ばれます）。\n送りたい人の行だけを選んでから、もう一度実行してください。", ui.ButtonSet.OK);
+    return;
+  }
+
+  ranges.forEach((range) => {
+    for (let row = range.getRow(); row <= Math.min(range.getLastRow(), lastRow); row++) {
+      if (row < 2 || rowNumbers.has(row)) {
+        continue;
       }
-    });
+
+      // フィルタなどで見えていない行は、選んだつもりがないため送らない
+      if (activeSheet.isRowHiddenByFilter(row) || activeSheet.isRowHiddenByUser(row)) {
+        hiddenCount++;
+        continue;
+      }
+
+      rowNumbers.add(row);
+    }
+  });
 
   if (rowNumbers.size === 0) {
-    ui.alert("選んだ行にメールを送る", "送りたい人の行（2行目以降）を選んでから実行してください。\nCtrl を押しながらクリックすると、離れた行もまとめて選べます。", ui.ButtonSet.OK);
+    ui.alert("選んだ行にメールを送る", "送りたい人の行（2行目以降・表示されている行）を選んでから実行してください。\nCtrl を押しながらクリックすると、離れた行もまとめて選べます。", ui.ButtonSet.OK);
     return;
   }
 
@@ -2380,7 +2393,7 @@ function showSelectedMailDialog() {
     };
   });
 
-  const html = HtmlService.createHtmlOutput(buildSelectedMailDialogHtml(selections))
+  const html = HtmlService.createHtmlOutput(buildSelectedMailDialogHtml(selections, hiddenCount))
     .setWidth(640)
     .setHeight(640);
   ui.showModalDialog(html, `選んだ行にメールを送る（${selections.length}行）`);
@@ -2595,10 +2608,11 @@ function formatSelectedSkipped(skipped) {
   return skipped.length > 0 ? `\n\n送らない人（${skipped.length}件）:\n${skipped.join("\n")}` : "";
 }
 
-function buildSelectedMailDialogHtml(selections) {
+function buildSelectedMailDialogHtml(selections, hiddenCount) {
   // </script> などで HTML が壊れないよう、< をエスケープして埋め込む
   const data = JSON.stringify({
     selections,
+    hiddenCount,
     types: SELECTED_MAIL_TYPES,
     defaultSubject: `【${EVENT_NAME}】お知らせ`,
   }).replace(/</g, "\\u003c");
@@ -2617,8 +2631,9 @@ function buildSelectedMailDialogHtml(selections) {
   button { padding: 6px 14px; margin-top: 10px; cursor: pointer; }
   #send { font-weight: bold; }
 </style></head><body>
-<h3>選んだ人</h3>
+<h3 id="selectedTitle"></h3>
 <div class="box" id="selected"></div>
+<div class="warn" id="hiddenNote"></div>
 <h3>送るメール</h3>
 <div id="types"></div>
 <div id="notice" class="hidden">
@@ -2640,6 +2655,8 @@ function buildSelectedMailDialogHtml(selections) {
   const data = ${data};
   const $ = (id) => document.getElementById(id);
   const selected = $("selected");
+  $("selectedTitle").textContent = "選んだ人（" + data.selections.length + "名）";
+  $("hiddenNote").textContent = data.hiddenCount > 0 ? "フィルタなどで非表示の行（" + data.hiddenCount + "行）は除きました。" : "";
   data.selections.forEach((s) => {
     const div = document.createElement("div");
     div.textContent = s.rowNumber + "行目 " + s.name + "（" + s.stage + "・" + s.status + "）";
